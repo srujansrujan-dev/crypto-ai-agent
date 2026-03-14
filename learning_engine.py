@@ -12,10 +12,16 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
-from config import DB_PATH, WEIGHTS_PATH, DEFAULT_WEIGHTS
+from config import (
+    DB_PATH,
+    DEFAULT_WEIGHTS,
+    SIGNAL_DEDUP_HOURS,
+    SIGNAL_MAX_AGE_HOURS,
+    WEIGHTS_PATH,
+)
 from signals import TradingSignal
 
 logger = logging.getLogger(__name__)
@@ -31,6 +37,7 @@ def init_db() -> None:
     cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id         TEXT,
             coin             TEXT    NOT NULL,
             symbol           TEXT    NOT NULL,
             timestamp        TEXT    NOT NULL,
@@ -48,6 +55,10 @@ def init_db() -> None:
             outcome_checked  INTEGER DEFAULT 0
         )
     """)
+    cur.execute("PRAGMA table_info(signals)")
+    columns = {row[1] for row in cur.fetchall()}
+    if "asset_id" not in columns:
+        cur.execute("ALTER TABLE signals ADD COLUMN asset_id TEXT")
     conn.commit()
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
@@ -59,11 +70,11 @@ def save_signal(signal: TradingSignal) -> int:
     cur  = conn.cursor()
     cur.execute("""
         INSERT INTO signals
-        (coin, symbol, timestamp, entry_price, target_price, stop_loss,
+        (asset_id, coin, symbol, timestamp, entry_price, target_price, stop_loss,
          buy_zone_low, buy_zone_high, confidence, ai_action, ai_reason, pump_score)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        signal.coin, signal.symbol, signal.timestamp,
+        signal.asset_id, signal.coin, signal.symbol, signal.timestamp,
         signal.entry_price, signal.target_price, signal.stop_loss,
         signal.buy_zone_low, signal.buy_zone_high,
         signal.confidence, signal.ai_action, signal.ai_reason, signal.pump_score,
@@ -72,6 +83,37 @@ def save_signal(signal: TradingSignal) -> int:
     conn.commit()
     conn.close()
     return row_id
+
+
+def has_recent_pending_signal(
+    asset_id: str,
+    symbol: str,
+    hours: int = SIGNAL_DEDUP_HOURS,
+) -> bool:
+    """Avoid duplicate open signals for the same asset within a short window."""
+    cutoff_iso = (
+        datetime.now(timezone.utc) - timedelta(hours=hours)
+    ).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM signals
+        WHERE outcome = 'PENDING'
+          AND timestamp >= ?
+          AND (
+            (asset_id IS NOT NULL AND asset_id != '' AND asset_id = ?)
+            OR symbol = ?
+          )
+        LIMIT 1
+        """,
+        (cutoff_iso, asset_id, symbol),
+    )
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
 
 
 def get_pending_signals() -> List[dict]:
@@ -162,7 +204,7 @@ def save_weights(weights: dict) -> None:
 def check_outcomes(current_prices: Dict[str, float]) -> None:
     """
     Compare current prices against pending signals.
-    Labels WIN if target hit, LOSS if stop-loss hit, NEUTRAL otherwise.
+    Labels WIN if target hit, LOSS if stop-loss hit, and NEUTRAL if the signal ages out.
     """
     pending = get_pending_signals()
     if not pending:
@@ -170,21 +212,39 @@ def check_outcomes(current_prices: Dict[str, float]) -> None:
 
     updated = 0
     for sig in pending:
-        sym   = sig["symbol"]
-        price = current_prices.get(sym)
+        asset_id = sig.get("asset_id") or ""
+        sym      = sig["symbol"]
+        price    = current_prices.get(asset_id) if asset_id else None
         if price is None:
-            continue
+            price = current_prices.get(sym)
 
-        if price >= sig["target_price"]:
+        if price is not None and price >= sig["target_price"]:
             update_signal_outcome(sig["id"], "WIN",  price)
             updated += 1
-        elif price <= sig["stop_loss"]:
+        elif price is not None and price <= sig["stop_loss"]:
             update_signal_outcome(sig["id"], "LOSS", price)
             updated += 1
-        # else still PENDING
+        elif _is_signal_stale(sig.get("timestamp")):
+            update_signal_outcome(sig["id"], "NEUTRAL", price or sig["entry_price"])
+            updated += 1
 
     if updated:
         logger.info("Outcome check: %d signals updated.", updated)
+
+
+def _is_signal_stale(timestamp: Optional[str]) -> bool:
+    if not timestamp:
+        return False
+    try:
+        created_at = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return False
+
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    age = datetime.now(timezone.utc) - created_at
+    return age >= timedelta(hours=SIGNAL_MAX_AGE_HOURS)
 
 
 # ── Weight adjustment (self-learning) ─────────────────────────────────────────

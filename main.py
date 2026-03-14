@@ -19,10 +19,11 @@ import time
 from datetime import datetime, timezone
 
 from config import (
-    SCAN_INTERVAL_SECONDS,
     DEFAULT_STOP_LOSS_PCT,
     DEFAULT_TARGET_PCT,
     LOG_FILE,
+    MAX_AI_EVALUATIONS_PER_CYCLE,
+    SCAN_INTERVAL_SECONDS,
 )
 from scanner        import fetch_market_data
 from indicators     import calculate_indicators
@@ -30,8 +31,13 @@ from pump_detector  import PumpDetector
 from trend_detector import TrendDetector
 from ai_engine      import analyse
 from learning_engine import (
-    init_db, save_signal, check_outcomes,
-    adjust_weights, load_weights, get_stats,
+    adjust_weights,
+    check_outcomes,
+    get_stats,
+    has_recent_pending_signal,
+    init_db,
+    load_weights,
+    save_signal,
 )
 from signals  import TradingSignal
 from alerts   import send_signal, send_cycle_summary, send_startup_banner
@@ -58,6 +64,7 @@ def build_signal(
 ) -> TradingSignal:
     entry = snap.current_price
     return TradingSignal(
+        asset_id     = snap.id,
         coin         = snap.name,
         symbol       = snap.symbol,
         timestamp    = datetime.now(timezone.utc).isoformat(),
@@ -87,7 +94,7 @@ def run_cycle(
         return
 
     # ── 2. Build price-map for outcome checking ────────────────────────────
-    price_map = {s.symbol: s.current_price for s in snapshots}
+    price_map = {s.id: s.current_price for s in snapshots}
 
     # ── 3. Calculate indicators ────────────────────────────────────────────
     indicators = [calculate_indicators(snap) for snap in snapshots]
@@ -101,7 +108,11 @@ def run_cycle(
 
     # ── 6. AI evaluation of top 5 opportunities ────────────────────────────
     signals_this_cycle = 0
-    for snap, ind, pump in opportunities[:5]:
+    for snap, ind, pump in opportunities[:MAX_AI_EVALUATIONS_PER_CYCLE]:
+        if has_recent_pending_signal(snap.id, snap.symbol):
+            logger.info("Skipping %s — recent pending signal already exists", snap.symbol)
+            continue
+
         trend_info = trends.evaluate(snap.id)
         action, confidence, reason = analyse(snap, ind, pump, trend_info)
 

@@ -49,6 +49,7 @@ class PumpScore:
 @dataclass
 class TradingSignal:
     """Full signal object — stored in DB and shown on dashboard."""
+    asset_id:        str
     coin:            str
     symbol:          str
     timestamp:       str

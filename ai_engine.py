@@ -8,11 +8,17 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 import google.generativeai as genai  # type: ignore
 
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import (
+    AI_MODEL_COOLDOWN_SECONDS,
+    AI_QUOTA_COOLDOWN_SECONDS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+)
 from signals import MarketSnapshot, IndicatorSet, PumpScore
 
 logger = logging.getLogger(__name__)
@@ -24,6 +30,8 @@ else:
     logger.warning("GEMINI_API_KEY not set — AI analysis will use fallback heuristics.")
 
 _MODEL = None
+_AI_DISABLED_UNTIL: Optional[datetime] = None
+_AI_DISABLE_REASON = ""
 
 
 def _get_model():
@@ -31,6 +39,25 @@ def _get_model():
     if _MODEL is None and GEMINI_API_KEY:
         _MODEL = genai.GenerativeModel(GEMINI_MODEL)
     return _MODEL
+
+
+def _disable_ai(seconds: int, reason: str) -> None:
+    global _AI_DISABLED_UNTIL, _AI_DISABLE_REASON
+    _AI_DISABLED_UNTIL = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    _AI_DISABLE_REASON = reason
+    logger.warning(
+        "AI disabled until %s UTC: %s",
+        _AI_DISABLED_UNTIL.isoformat(timespec="seconds"),
+        reason,
+    )
+
+
+def _ai_disabled_reason() -> Optional[str]:
+    if _AI_DISABLED_UNTIL is None:
+        return None
+    if datetime.now(timezone.utc) >= _AI_DISABLED_UNTIL:
+        return None
+    return _AI_DISABLE_REASON or "AI temporarily disabled."
 
 
 def _build_prompt(
@@ -123,6 +150,11 @@ def analyse(
     Call Gemini and return (action, confidence, reason).
     Falls back to heuristics if API is unavailable.
     """
+    disabled_reason = _ai_disabled_reason()
+    if disabled_reason:
+        logger.warning("AI unavailable for %s — using fallback: %s", snapshot.symbol, disabled_reason)
+        return _fallback_analysis(pump, indicators)
+
     model = _get_model()
     if not model:
         logger.warning("No Gemini model — using fallback heuristics for %s.", snapshot.symbol)
@@ -162,11 +194,25 @@ def analyse(
         except json.JSONDecodeError as exc:
             logger.warning("JSON parse error attempt %d: %s | raw: %s", attempt, exc, text[:200])
         except Exception as exc:
+            message = str(exc)
+            lowered = message.lower()
             logger.error("Gemini API error attempt %d: %s", attempt, exc)
-            if "quota" in str(exc).lower() or "429" in str(exc):
-                logger.warning("Gemini quota hit — sleeping 60s.")
-                time.sleep(60)
-            elif attempt < retries:
+
+            if "quota" in lowered or "429" in lowered:
+                _disable_ai(
+                    AI_QUOTA_COOLDOWN_SECONDS,
+                    "Gemini quota exceeded; switching to rule-based fallback.",
+                )
+                break
+
+            if "404" in lowered and "model" in lowered:
+                _disable_ai(
+                    AI_MODEL_COOLDOWN_SECONDS,
+                    f"Configured model '{GEMINI_MODEL}' is unavailable for this key/API version.",
+                )
+                break
+
+            if attempt < retries:
                 time.sleep(5)
 
     logger.warning("All Gemini attempts failed — using fallback for %s.", snapshot.symbol)

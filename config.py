@@ -22,6 +22,9 @@ SCAN_INTERVAL_SECONDS = 300         # 5 minutes
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 GEMINI_MODEL = "gemini-2.0-flash"
+MAX_AI_EVALUATIONS_PER_CYCLE = 5
+AI_QUOTA_COOLDOWN_SECONDS    = 6 * 60 * 60
+AI_MODEL_COOLDOWN_SECONDS    = 24 * 60 * 60
 
 # ── Scoring weights (learning engine updates data/weights.json at runtime) ────
 DEFAULT_WEIGHTS = {
@@ -35,6 +38,8 @@ OPPORTUNITY_SCORE_THRESHOLD = 70
 # ── Signal risk defaults ──────────────────────────────────────────────────────
 DEFAULT_STOP_LOSS_PCT = 0.05
 DEFAULT_TARGET_PCT    = 0.15
+SIGNAL_MAX_AGE_HOURS  = 48
+SIGNAL_DEDUP_HOURS    = 12
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 DB_PATH      = "data/signals.db"

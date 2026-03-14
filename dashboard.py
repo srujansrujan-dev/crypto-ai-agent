@@ -91,6 +91,25 @@ HTML = """
       border-radius: 20px; padding: 4px 14px; font-size: 0.78rem;
     }
     .weight-pill span { color: #58a6ff; font-weight: 700; }
+    .hero-card {
+      background: linear-gradient(135deg, #182235, #142033);
+      border: 1px solid #2f4868; border-radius: 12px;
+      padding: 18px; margin-bottom: 24px;
+    }
+    .hero-title {
+      color: #8b949e; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 10px; font-weight: 700;
+    }
+    .hero-coin {
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    .hero-coin strong { font-size: 1.2rem; color: #f0f6fc; }
+    .hero-metrics {
+      display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px;
+      color: #c9d1d9; font-size: 0.88rem;
+    }
+    .hero-reason { color: #8b949e; font-size: 0.84rem; line-height: 1.5; }
     .refresh-note { color: #484f58; font-size: 0.75rem; margin-top: 20px; }
   </style>
 </head>
@@ -134,6 +153,25 @@ HTML = """
     <div class="weight-pill">{{ k.replace('_', ' ').title() }}: <span>{{ v }}</span></div>
     {% endfor %}
   </div>
+
+  {% if best_signal %}
+  <div class="hero-card">
+    <div class="hero-title">Best Current Signal</div>
+    <div class="hero-coin">
+      <strong>{{ best_signal.symbol }}</strong>
+      <span>{{ best_signal.coin }}</span>
+      <span class="badge badge-{{ best_signal.ai_action | lower }}">{{ best_signal.ai_action }}</span>
+      <span class="badge badge-{{ best_signal.outcome | lower }}">{{ best_signal.outcome }}</span>
+    </div>
+    <div class="hero-metrics">
+      <span>Entry: ${{ "%.4f"|format(best_signal.entry_price) }}</span>
+      <span>Target: ${{ "%.4f"|format(best_signal.target_price) }}</span>
+      <span>Confidence: {{ best_signal.confidence | int }}%</span>
+      <span>Score: {{ best_signal.pump_score | int }}/100</span>
+    </div>
+    <p class="hero-reason">{{ best_signal.ai_reason }}</p>
+  </div>
+  {% endif %}
 
   <!-- Signals table -->
   <div class="section-title">🔔 Latest Signals</div>
@@ -189,9 +227,15 @@ def index():
     signals = get_recent_signals(50)
     stats   = get_stats()
     weights = load_weights()
+    best_signal = _pick_best_signal(signals)
     now     = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     return render_template_string(
-        HTML, signals=signals, stats=stats, weights=weights, now=now
+        HTML,
+        signals=signals,
+        stats=stats,
+        weights=weights,
+        best_signal=best_signal,
+        now=now,
     )
 
 
@@ -208,6 +252,24 @@ def api_stats():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+def _pick_best_signal(signals):
+    pending = [s for s in signals if s.get("outcome") == "PENDING"]
+    pool = pending or signals
+    if not pool:
+        return None
+
+    def rank(signal):
+        action_priority = {"BUY": 2, "HOLD": 1, "AVOID": 0}.get(signal.get("ai_action"), 0)
+        return (
+            action_priority,
+            float(signal.get("confidence", 0)),
+            float(signal.get("pump_score", 0)),
+            signal.get("timestamp", ""),
+        )
+
+    return max(pool, key=rank)
 
 
 def start_dashboard() -> None:
