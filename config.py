@@ -21,7 +21,7 @@ COINGECKO_PAGE_SIZE = 250
 SCAN_INTERVAL_SECONDS = 300         # 5 minutes
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 # ── Scoring weights (learning engine updates data/weights.json at runtime) ────
 DEFAULT_WEIGHTS = {

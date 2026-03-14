@@ -10,7 +10,7 @@ import re
 import time
 from typing import Optional, Tuple
 
-import google.generativeai as genai
+import google.generativeai as genai  # type: ignore
 
 from config import GEMINI_API_KEY, GEMINI_MODEL
 from signals import MarketSnapshot, IndicatorSet, PumpScore
