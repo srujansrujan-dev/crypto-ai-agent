@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: crypto-ai-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # you enter this in Render dashboard
+      - key: PORT
+        generateValue: false
+    autoDeploy: true
