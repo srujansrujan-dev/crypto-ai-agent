@@ -21,6 +21,8 @@ if COINGECKO_API_KEY:
 
 COINDCX_BASE_URL = "https://api.coindcx.com"
 REQUEST_DELAY    = 2.5
+_MARKET_CHART_CACHE: Dict[str, Dict[str, Any]] = {}
+_MARKET_CHART_TTL_SECONDS = 15 * 60
 
 
 def _cg_get(endpoint: str, params: dict, retries: int = 3) -> Optional[Any]:
@@ -165,6 +167,39 @@ def fetch_market_data(coins_to_fetch: int = COINS_PER_CYCLE) -> List[MarketSnaps
         len(cg_symbols) - added, added, len(cg_snaps),
     )
     return cg_snaps
+
+
+def fetch_coin_market_chart(coin_id: str, days: int = 7) -> Dict[str, List[float]]:
+    """
+    Fetch short historical market context for a coin.
+
+    Returns prices, volumes, and market caps from CoinGecko's market_chart endpoint.
+    CoinDCX-only synthetic ids do not have historical context here.
+    """
+    if not coin_id or coin_id.startswith("coindcx_"):
+        return {}
+
+    cache_key = f"{coin_id}:{days}"
+    cached = _MARKET_CHART_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached["fetched_at"] < _MARKET_CHART_TTL_SECONDS:
+        return cached["payload"]
+
+    params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+    data = _cg_get(f"/coins/{coin_id}/market_chart", params)
+    if not data:
+        return {}
+
+    payload = {
+        "prices": [float(row[1]) for row in data.get("prices", []) if len(row) >= 2],
+        "volumes": [float(row[1]) for row in data.get("total_volumes", []) if len(row) >= 2],
+        "market_caps": [float(row[1]) for row in data.get("market_caps", []) if len(row) >= 2],
+    }
+    _MARKET_CHART_CACHE[cache_key] = {
+        "fetched_at": now,
+        "payload": payload,
+    }
+    return payload
 
 
 def fetch_coin_history(coin_id: str, days: int = 30) -> List[Dict]:

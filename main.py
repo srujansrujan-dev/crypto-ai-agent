@@ -1,16 +1,15 @@
 """
-main.py — Entry point for the Crypto AI Agent.
+main.py - Entry point for the Crypto AI Agent.
 
-Loop:
-  1. Fetch market data (500+ coins via CoinGecko)
-  2. Calculate indicators for each coin
-  3. Run pump detection scoring
-  4. Detect multi-cycle trends
-  5. AI-evaluate top opportunities (Gemini)
-  6. Save signals to SQLite
-  7. Check outcomes of past signals → label WIN/LOSS/NEUTRAL
-  8. Adjust scoring weights (self-learning)
-  9. Sleep 5 minutes → repeat
+Pipeline:
+1. Fetch broad market data
+2. Build indicators and trend history
+3. Classify the current market regime
+4. Run a rough scan to create an internal watchlist
+5. Deep-scan only shortlisted coins
+6. Final-evaluate the strongest candidates
+7. Save only the strongest publishable signals
+8. Check outcomes and update learning weights
 """
 
 import logging
@@ -18,6 +17,8 @@ import os
 import time
 from datetime import datetime, timezone
 
+from ai_engine import analyse
+from alerts import send_cycle_summary, send_signal, send_startup_banner
 from config import (
     ALLOWED_SIGNAL_ACTIONS,
     DEFAULT_STOP_LOSS_PCT,
@@ -25,18 +26,20 @@ from config import (
     LOG_FILE,
     MAX_AI_EVALUATIONS_PER_CYCLE,
     MAX_SIGNALS_PER_CYCLE,
-    MIN_SIGNAL_AGGREGATE_SCORE,
+    MAX_SIGNAL_RISK_SCORE,
     MIN_SIGNAL_CONFIDENCE,
+    MIN_SIGNAL_FINAL_SCORE,
+    MIN_SIGNAL_LIQUIDITY_SCORE,
     MIN_SIGNAL_PUMP_SCORE,
     MIN_SIGNAL_QUALITY_SCORE,
     MIN_SIGNAL_TREND_SCORE,
     SCAN_INTERVAL_SECONDS,
+    WATCHLIST_DEEP_LIMIT,
+    WATCHLIST_LOG_LIMIT,
+    WATCHLIST_ROUGH_LIMIT,
 )
-from scanner        import fetch_market_data
-from indicators     import calculate_indicators
-from pump_detector  import PumpDetector
-from trend_detector import TrendDetector
-from ai_engine      import analyse
+from dashboard import start_dashboard
+from indicators import calculate_indicators
 from learning_engine import (
     adjust_weights,
     check_outcomes,
@@ -46,16 +49,22 @@ from learning_engine import (
     load_weights,
     save_signal,
 )
-from signals  import TradingSignal
-from alerts   import send_signal, send_cycle_summary, send_startup_banner
-from dashboard import start_dashboard
+from market_intelligence import (
+    analyse_deep_context,
+    calculate_final_publish_score,
+    classify_market_regime,
+    score_watchlist_candidate,
+)
+from pump_detector import PumpDetector
+from scanner import fetch_coin_market_chart, fetch_market_data
+from signals import TradingSignal
+from trend_detector import TrendDetector
 
 
-# ── Logging setup ──────────────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    format="%(asctime)s  %(levelname)-8s  %(name)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(LOG_FILE),
@@ -63,8 +72,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ── Agent ─────────────────────────────────────────────────────────────────────
 
 def build_signal(
     snap,
@@ -74,32 +81,49 @@ def build_signal(
     ai_confidence,
     ai_reason,
     quality_score,
-    aggregate_score,
+    final_score,
+    deep_context,
+    regime,
     trend_score,
 ) -> TradingSignal:
     entry = snap.current_price
+    context_suffix = (
+        f" Regime: {regime.get('label', 'UNKNOWN')} ({regime.get('score', 50):.0f}/100)."
+        f" Deep score: {deep_context.get('deep_score', 0):.0f}/100."
+        f" Liquidity: {deep_context.get('liquidity_score', 0):.0f}/100."
+        f" Risk proxy: {deep_context.get('risk_score', 0):.0f}/100."
+    )
+    risk_notes = deep_context.get("risk_notes") or []
+    if risk_notes:
+        context_suffix += f" Note: {risk_notes[0]}."
+
     return TradingSignal(
-        asset_id     = snap.id,
-        coin         = snap.name,
-        symbol       = snap.symbol,
-        timestamp    = datetime.now(timezone.utc).isoformat(),
-        entry_price  = entry,
-        target_price = round(entry * (1 + DEFAULT_TARGET_PCT), 8),
-        stop_loss    = round(entry * (1 - DEFAULT_STOP_LOSS_PCT), 8),
-        buy_zone_low = round(entry * 0.99, 8),
-        buy_zone_high= round(entry * 1.01, 8),
-        confidence   = ai_confidence,
-        ai_action    = ai_action,
-        ai_reason    = ai_reason,
-        pump_score   = pump_score.total_score,
-        quality_score= quality_score,
-        aggregate_score = aggregate_score,
-        trend_score  = trend_score,
-        volume_ratio = ind.volume_ratio,
-        momentum     = ind.momentum,
-        rsi          = float(ind.rsi or 50.0),
-        market_cap   = snap.market_cap,
-        price_change_24h = snap.price_change_24h,
+        asset_id=snap.id,
+        coin=snap.name,
+        symbol=snap.symbol,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        entry_price=entry,
+        target_price=round(entry * (1 + DEFAULT_TARGET_PCT), 8),
+        stop_loss=round(entry * (1 - DEFAULT_STOP_LOSS_PCT), 8),
+        buy_zone_low=round(entry * 0.99, 8),
+        buy_zone_high=round(entry * 1.01, 8),
+        confidence=ai_confidence,
+        ai_action=ai_action,
+        ai_reason=f"{ai_reason}{context_suffix}",
+        pump_score=pump_score.total_score,
+        quality_score=quality_score,
+        aggregate_score=final_score,
+        deep_score=deep_context.get("deep_score", 0.0),
+        liquidity_score=deep_context.get("liquidity_score", 0.0),
+        risk_score=deep_context.get("risk_score", 0.0),
+        market_regime=regime.get("label", "UNKNOWN"),
+        regime_score=regime.get("score", 50.0),
+        trend_score=trend_score,
+        volume_ratio=ind.volume_ratio,
+        momentum=ind.momentum,
+        rsi=float(ind.rsi or 50.0),
+        market_cap=snap.market_cap,
+        price_change_24h=snap.price_change_24h,
     )
 
 
@@ -167,7 +191,7 @@ def calculate_signal_quality(
     return round(max(0.0, min(100.0, quality)), 2)
 
 
-def calculate_aggregate_signal_score(
+def calculate_final_base_score(
     snap,
     ind,
     pump_score,
@@ -183,32 +207,32 @@ def calculate_aggregate_signal_score(
         and snap.current_price >= (ind.ma50 or snap.current_price)
     )
 
-    aggregate = pump_score.total_score * 0.28
-    aggregate += quality_score * 0.34
-    aggregate += ai_confidence * 0.18
-    aggregate += min(trend_score, 60.0) * 0.10
-    aggregate += min(ind.volume_ratio, 6.0) * 2.2
-    aggregate += min(max(ind.momentum, 0.0), 20.0) * 0.55
-    aggregate += {"BUY": 8, "HOLD": -10, "AVOID": -24}.get(ai_action, -8)
+    final_score = pump_score.total_score * 0.28
+    final_score += quality_score * 0.34
+    final_score += ai_confidence * 0.18
+    final_score += min(trend_score, 60.0) * 0.10
+    final_score += min(ind.volume_ratio, 6.0) * 2.2
+    final_score += min(max(ind.momentum, 0.0), 20.0) * 0.55
+    final_score += {"BUY": 8, "HOLD": -10, "AVOID": -24}.get(ai_action, -8)
 
     if above_mas:
-        aggregate += 4
+        final_score += 4
 
     if 45 <= rsi <= 68:
-        aggregate += 4
+        final_score += 4
     elif rsi > 78:
-        aggregate -= 18
+        final_score -= 18
     elif rsi > 72:
-        aggregate -= 10
+        final_score -= 10
     elif rsi < 25:
-        aggregate -= 6
+        final_score -= 6
 
     if snap.price_change_24h >= 18:
-        aggregate -= 8
+        final_score -= 8
     elif snap.price_change_24h >= 12:
-        aggregate -= 4
+        final_score -= 4
 
-    return round(max(0.0, min(100.0, aggregate)), 2)
+    return round(max(0.0, min(100.0, final_score)), 2)
 
 
 def should_emit_signal(
@@ -217,10 +241,15 @@ def should_emit_signal(
     ai_action,
     ai_confidence,
     quality_score,
-    aggregate_score,
+    final_score,
+    deep_context,
+    regime,
     trend_info,
 ) -> bool:
     trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    liquidity_score = deep_context.get("liquidity_score", 0.0)
+    risk_score = deep_context.get("risk_score", 0.0)
+    market_regime = regime.get("label", "UNKNOWN")
 
     if ai_action not in ALLOWED_SIGNAL_ACTIONS:
         logger.info("Rejecting %s because action %s is below the signal bar", snap.symbol, ai_action)
@@ -247,10 +276,10 @@ def should_emit_signal(
         )
         return False
 
-    if aggregate_score < MIN_SIGNAL_AGGREGATE_SCORE:
+    if final_score < MIN_SIGNAL_FINAL_SCORE:
         logger.info(
-            "Rejecting %s because aggregate %.1f is below %.1f",
-            snap.symbol, aggregate_score, MIN_SIGNAL_AGGREGATE_SCORE,
+            "Rejecting %s because final score %.1f is below %.1f",
+            snap.symbol, final_score, MIN_SIGNAL_FINAL_SCORE,
         )
         return False
 
@@ -261,65 +290,142 @@ def should_emit_signal(
         )
         return False
 
+    if liquidity_score < MIN_SIGNAL_LIQUIDITY_SCORE:
+        logger.info(
+            "Rejecting %s because liquidity %.1f is below %.1f",
+            snap.symbol, liquidity_score, MIN_SIGNAL_LIQUIDITY_SCORE,
+        )
+        return False
+
+    if risk_score > MAX_SIGNAL_RISK_SCORE:
+        logger.info(
+            "Rejecting %s because risk proxy %.1f is above %.1f",
+            snap.symbol, risk_score, MAX_SIGNAL_RISK_SCORE,
+        )
+        return False
+
+    if market_regime == "PANIC" and snap.symbol not in {"BTC", "ETH", "SOL"}:
+        logger.info("Rejecting %s because market regime is PANIC", snap.symbol)
+        return False
+
     return True
 
 
 def run_cycle(
-    cycle:    int,
+    cycle: int,
     detector: PumpDetector,
-    trends:   TrendDetector,
+    trends: TrendDetector,
 ) -> None:
-    logger.info("── Cycle %d starting ──", cycle)
+    logger.info("â”€â”€ Cycle %d starting â”€â”€", cycle)
 
-    # ── 1. Fetch market data ───────────────────────────────────────────────
     snapshots = fetch_market_data()
     if not snapshots:
-        logger.warning("No market data returned — skipping cycle.")
+        logger.warning("No market data returned â€” skipping cycle.")
         return
 
-    # ── 2. Build price-map for outcome checking ────────────────────────────
-    price_map = {s.id: s.current_price for s in snapshots}
-
-    # ── 3. Calculate indicators ────────────────────────────────────────────
+    price_map = {snap.id: snap.current_price for snap in snapshots}
     indicators = [calculate_indicators(snap) for snap in snapshots]
-
-    # ── 4. Update trend detector history ──────────────────────────────────
     trends.update(snapshots)
 
-    # ── 5. Pump detection scan ─────────────────────────────────────────────
+    market_regime = classify_market_regime(snapshots)
+    logger.info(
+        "Market regime â€” %s score=%.1f breadth24=%.2f median24h=%.2f%%",
+        market_regime["label"],
+        market_regime["score"],
+        market_regime["breadth_24h"],
+        market_regime["median_change_24h"],
+    )
+
     opportunities = detector.scan(snapshots, indicators)
     logger.info("Opportunities flagged: %d", len(opportunities))
-    ranked_opportunities = []
+
+    rough_candidates = []
     for snap, ind, pump in opportunities:
         trend_info = trends.evaluate(snap.id)
-        ranked_opportunities.append(
-            (rank_opportunity(snap, ind, pump, trend_info), snap, ind, pump, trend_info)
+        rough_candidates.append(
+            {
+                "rough_score": rank_opportunity(snap, ind, pump, trend_info),
+                "snapshot": snap,
+                "indicators": ind,
+                "pump": pump,
+                "trend_info": trend_info,
+            }
         )
-    ranked_opportunities.sort(key=lambda item: item[0], reverse=True)
+    rough_candidates.sort(key=lambda item: item["rough_score"], reverse=True)
 
-    # ── 6. AI evaluation of top 5 opportunities ────────────────────────────
+    watchlist = []
+    for index, candidate in enumerate(rough_candidates[:WATCHLIST_ROUGH_LIMIT]):
+        snap = candidate["snapshot"]
+        history = fetch_coin_market_chart(snap.id, days=7) if index < WATCHLIST_DEEP_LIMIT else {}
+        deep_context = analyse_deep_context(
+            snap,
+            candidate["indicators"],
+            candidate["trend_info"],
+            history,
+            market_regime,
+        )
+        candidate["deep_context"] = deep_context
+        candidate["watchlist_score"] = score_watchlist_candidate(
+            snap,
+            candidate["pump"],
+            candidate["rough_score"],
+            deep_context,
+            market_regime,
+        )
+        watchlist.append(candidate)
+
+    watchlist.sort(key=lambda item: item["watchlist_score"], reverse=True)
+    if watchlist:
+        top_watchlist = ", ".join(
+            f"{item['snapshot'].symbol}:{item['watchlist_score']:.1f}"
+            for item in watchlist[:WATCHLIST_LOG_LIMIT]
+        )
+        logger.info("Internal watchlist â€” %s", top_watchlist)
+
     candidate_signals = []
-    for _, snap, ind, pump, trend_info in ranked_opportunities[:MAX_AI_EVALUATIONS_PER_CYCLE]:
+    for candidate in watchlist[:MAX_AI_EVALUATIONS_PER_CYCLE]:
+        snap = candidate["snapshot"]
+        ind = candidate["indicators"]
+        pump = candidate["pump"]
+        trend_info = candidate["trend_info"]
+        deep_context = candidate["deep_context"]
+
         if has_recent_pending_signal(snap.id, snap.symbol):
-            logger.info("Skipping %s — recent pending signal already exists", snap.symbol)
+            logger.info("Skipping %s â€” recent pending signal already exists", snap.symbol)
             continue
 
-        trend_info = trends.evaluate(snap.id)
         action, confidence, reason = analyse(snap, ind, pump, trend_info)
         quality_score = calculate_signal_quality(
             snap, ind, pump, action, confidence, trend_info,
         )
-        aggregate_score = calculate_aggregate_signal_score(
+        base_final_score = calculate_final_base_score(
             snap, ind, pump, action, confidence, quality_score, trend_info,
+        )
+        final_score = calculate_final_publish_score(
+            snap,
+            action,
+            confidence,
+            quality_score,
+            base_final_score,
+            deep_context,
+            market_regime,
         )
 
         if not should_emit_signal(
-            snap, pump, action, confidence, quality_score, aggregate_score, trend_info,
+            snap,
+            pump,
+            action,
+            confidence,
+            quality_score,
+            final_score,
+            deep_context,
+            market_regime,
+            trend_info,
         ):
             continue
 
         if action == "AVOID":
-            logger.info("Skipping %s — AI says AVOID", snap.symbol)
+            logger.info("Skipping %s â€” AI says AVOID", snap.symbol)
             continue
 
         signal = build_signal(
@@ -330,7 +436,9 @@ def run_cycle(
             confidence,
             reason,
             quality_score,
-            aggregate_score,
+            final_score,
+            deep_context,
+            market_regime,
             trend_info.get("trend_score", 0.0) if trend_info else 0.0,
         )
         candidate_signals.append(signal)
@@ -338,6 +446,7 @@ def run_cycle(
     candidate_signals.sort(
         key=lambda signal: (
             signal.aggregate_score,
+            signal.deep_score,
             signal.quality_score,
             signal.confidence,
             signal.pump_score,
@@ -351,35 +460,27 @@ def run_cycle(
         send_signal(signal)
         signals_this_cycle += 1
 
-    # ── 7. Check past signal outcomes ─────────────────────────────────────
     check_outcomes(price_map)
-
-    # ── 8. Self-learning: adjust weights ──────────────────────────────────
     new_weights = adjust_weights()
     detector.set_weights(new_weights)
 
-    # ── 9. Cycle summary ───────────────────────────────────────────────────
     send_cycle_summary(cycle, len(snapshots), len(opportunities), signals_this_cycle)
     stats = get_stats()
     logger.info(
-        "Stats — Total: %d | Win rate: %.1f%% | Pending: %d",
+        "Stats â€” Total: %d | Win rate: %.1f%% | Pending: %d",
         stats["total"], stats["win_rate"], stats["pending"],
     )
 
 
 def main() -> None:
     send_startup_banner()
-
-    # Initialise DB
     init_db()
 
-    # Load adaptive weights
-    weights  = load_weights()
+    weights = load_weights()
     detector = PumpDetector()
     detector.set_weights(weights)
-    trends   = TrendDetector()
+    trends = TrendDetector()
 
-    # Start web dashboard (background thread)
     start_dashboard()
 
     cycle = 1
@@ -387,13 +488,13 @@ def main() -> None:
         try:
             run_cycle(cycle, detector, trends)
         except KeyboardInterrupt:
-            logger.info("Shutdown requested — exiting.")
+            logger.info("Shutdown requested â€” exiting.")
             break
         except Exception as exc:
             logger.exception("Unhandled error in cycle %d: %s", cycle, exc)
 
         cycle += 1
-        logger.info("Sleeping %ds until next cycle …", SCAN_INTERVAL_SECONDS)
+        logger.info("Sleeping %ds until next cycle â€¦", SCAN_INTERVAL_SECONDS)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 

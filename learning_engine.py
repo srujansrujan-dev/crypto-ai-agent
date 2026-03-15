@@ -55,6 +55,11 @@ _SIGNAL_COLUMN_TYPES = {
     "pump_score": "REAL NOT NULL",
     "quality_score": "REAL DEFAULT 0",
     "aggregate_score": "REAL DEFAULT 0",
+    "deep_score": "REAL DEFAULT 0",
+    "liquidity_score": "REAL DEFAULT 0",
+    "risk_score": "REAL DEFAULT 0",
+    "market_regime": "TEXT DEFAULT 'UNKNOWN'",
+    "regime_score": "REAL DEFAULT 50",
     "trend_score": "REAL DEFAULT 0",
     "volume_ratio": "REAL DEFAULT 0",
     "momentum": "REAL DEFAULT 0",
@@ -144,6 +149,11 @@ def _ensure_sqlite_schema(conn) -> None:
             pump_score       REAL    NOT NULL,
             quality_score    REAL    DEFAULT 0,
             aggregate_score  REAL    DEFAULT 0,
+            deep_score       REAL    DEFAULT 0,
+            liquidity_score  REAL    DEFAULT 0,
+            risk_score       REAL    DEFAULT 0,
+            market_regime    TEXT    DEFAULT 'UNKNOWN',
+            regime_score     REAL    DEFAULT 50,
             trend_score      REAL    DEFAULT 0,
             volume_ratio     REAL    DEFAULT 0,
             momentum         REAL    DEFAULT 0,
@@ -195,6 +205,11 @@ def _ensure_postgres_schema(conn) -> None:
             pump_score       DOUBLE PRECISION NOT NULL,
             quality_score    DOUBLE PRECISION DEFAULT 0,
             aggregate_score  DOUBLE PRECISION DEFAULT 0,
+            deep_score       DOUBLE PRECISION DEFAULT 0,
+            liquidity_score  DOUBLE PRECISION DEFAULT 0,
+            risk_score       DOUBLE PRECISION DEFAULT 0,
+            market_regime    TEXT DEFAULT 'UNKNOWN',
+            regime_score     DOUBLE PRECISION DEFAULT 50,
             trend_score      DOUBLE PRECISION DEFAULT 0,
             volume_ratio     DOUBLE PRECISION DEFAULT 0,
             momentum         DOUBLE PRECISION DEFAULT 0,
@@ -263,6 +278,11 @@ def _signal_payload(signal: TradingSignal):
         signal.pump_score,
         signal.quality_score,
         signal.aggregate_score,
+        signal.deep_score,
+        signal.liquidity_score,
+        signal.risk_score,
+        signal.market_regime,
+        signal.regime_score,
         signal.trend_score,
         signal.volume_ratio,
         signal.momentum,
@@ -283,33 +303,31 @@ def save_signal(signal: TradingSignal) -> int:
         columns = (
             "asset_id, coin, symbol, timestamp, entry_price, target_price, "
             "stop_loss, buy_zone_low, buy_zone_high, confidence, ai_action, "
-            "ai_reason, pump_score, quality_score, aggregate_score, trend_score, volume_ratio, "
+            "ai_reason, pump_score, quality_score, aggregate_score, deep_score, "
+            "liquidity_score, risk_score, market_regime, regime_score, trend_score, volume_ratio, "
             "momentum, rsi, market_cap, price_change_24h, outcome, "
             "outcome_price, outcome_checked"
         )
+        payload = _signal_payload(signal)
         if backend == "postgres":
+            placeholders = ", ".join(["%s"] * len(payload))
             cur.execute(
                 f"""
                 INSERT INTO signals ({columns})
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                )
+                VALUES ({placeholders})
                 RETURNING id
                 """,
-                _signal_payload(signal),
+                payload,
             )
             row_id = cur.fetchone()[0]
         else:
+            placeholders = ", ".join(["?"] * len(payload))
             cur.execute(
                 f"""
                 INSERT INTO signals ({columns})
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
+                VALUES ({placeholders})
                 """,
-                _signal_payload(signal),
+                payload,
             )
             row_id = cur.lastrowid
         conn.commit()

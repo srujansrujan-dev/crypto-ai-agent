@@ -63,6 +63,11 @@ class TradingSignal:
     pump_score:      float
     quality_score:   float
     aggregate_score: float
+    deep_score:      float
+    liquidity_score: float
+    risk_score:      float
+    market_regime:   str
+    regime_score:    float
     trend_score:     float
     volume_ratio:    float
     momentum:        float
