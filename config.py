@@ -24,7 +24,7 @@ SCAN_INTERVAL_SECONDS = 300         # 5 minutes
 # ── Gemini ────────────────────────────────────────────────────────────────────
 GEMINI_MODEL = "gemini-2.0-flash"
 MAX_AI_EVALUATIONS_PER_CYCLE = 5
-MAX_SIGNALS_PER_CYCLE        = 3
+MAX_SIGNALS_PER_CYCLE        = 2
 AI_QUOTA_COOLDOWN_SECONDS    = 6 * 60 * 60
 AI_MODEL_COOLDOWN_SECONDS    = 24 * 60 * 60
 
@@ -41,6 +41,7 @@ MIN_SIGNAL_CONFIDENCE       = 55.0
 MIN_SIGNAL_PUMP_SCORE       = 85.0
 MIN_SIGNAL_QUALITY_SCORE    = 75.0
 MIN_SIGNAL_TREND_SCORE      = 25.0
+MIN_SIGNAL_AGGREGATE_SCORE  = 82.0
 
 # ── Signal risk defaults ──────────────────────────────────────────────────────
 DEFAULT_STOP_LOSS_PCT = 0.05

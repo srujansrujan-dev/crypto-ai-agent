@@ -54,6 +54,7 @@ _SIGNAL_COLUMN_TYPES = {
     "ai_reason": "TEXT",
     "pump_score": "REAL NOT NULL",
     "quality_score": "REAL DEFAULT 0",
+    "aggregate_score": "REAL DEFAULT 0",
     "trend_score": "REAL DEFAULT 0",
     "volume_ratio": "REAL DEFAULT 0",
     "momentum": "REAL DEFAULT 0",
@@ -142,6 +143,7 @@ def _ensure_sqlite_schema(conn) -> None:
             ai_reason        TEXT,
             pump_score       REAL    NOT NULL,
             quality_score    REAL    DEFAULT 0,
+            aggregate_score  REAL    DEFAULT 0,
             trend_score      REAL    DEFAULT 0,
             volume_ratio     REAL    DEFAULT 0,
             momentum         REAL    DEFAULT 0,
@@ -192,6 +194,7 @@ def _ensure_postgres_schema(conn) -> None:
             ai_reason        TEXT,
             pump_score       DOUBLE PRECISION NOT NULL,
             quality_score    DOUBLE PRECISION DEFAULT 0,
+            aggregate_score  DOUBLE PRECISION DEFAULT 0,
             trend_score      DOUBLE PRECISION DEFAULT 0,
             volume_ratio     DOUBLE PRECISION DEFAULT 0,
             momentum         DOUBLE PRECISION DEFAULT 0,
@@ -259,6 +262,7 @@ def _signal_payload(signal: TradingSignal):
         signal.ai_reason,
         signal.pump_score,
         signal.quality_score,
+        signal.aggregate_score,
         signal.trend_score,
         signal.volume_ratio,
         signal.momentum,
@@ -279,7 +283,7 @@ def save_signal(signal: TradingSignal) -> int:
         columns = (
             "asset_id, coin, symbol, timestamp, entry_price, target_price, "
             "stop_loss, buy_zone_low, buy_zone_high, confidence, ai_action, "
-            "ai_reason, pump_score, quality_score, trend_score, volume_ratio, "
+            "ai_reason, pump_score, quality_score, aggregate_score, trend_score, volume_ratio, "
             "momentum, rsi, market_cap, price_change_24h, outcome, "
             "outcome_price, outcome_checked"
         )
@@ -289,7 +293,7 @@ def save_signal(signal: TradingSignal) -> int:
                 INSERT INTO signals ({columns})
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 RETURNING id
                 """,
@@ -302,7 +306,7 @@ def save_signal(signal: TradingSignal) -> int:
                 INSERT INTO signals ({columns})
                 VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 _signal_payload(signal),
@@ -634,8 +638,11 @@ def _feature_bias(rows: List[dict]) -> dict:
             continue
 
         quality = _coerce_float(
-            row.get("quality_score"),
-            _coerce_float(row.get("pump_score")),
+            row.get("aggregate_score"),
+            _coerce_float(
+                row.get("quality_score"),
+                _coerce_float(row.get("pump_score")),
+            ),
         )
         importance = 0.5 + max(0.0, min(100.0, quality)) / 200.0
 

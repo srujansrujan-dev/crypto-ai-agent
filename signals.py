@@ -62,6 +62,7 @@ class TradingSignal:
     ai_reason:       str
     pump_score:      float
     quality_score:   float
+    aggregate_score: float
     trend_score:     float
     volume_ratio:    float
     momentum:        float

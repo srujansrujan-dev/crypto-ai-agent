@@ -25,6 +25,7 @@ from config import (
     LOG_FILE,
     MAX_AI_EVALUATIONS_PER_CYCLE,
     MAX_SIGNALS_PER_CYCLE,
+    MIN_SIGNAL_AGGREGATE_SCORE,
     MIN_SIGNAL_CONFIDENCE,
     MIN_SIGNAL_PUMP_SCORE,
     MIN_SIGNAL_QUALITY_SCORE,
@@ -73,6 +74,7 @@ def build_signal(
     ai_confidence,
     ai_reason,
     quality_score,
+    aggregate_score,
     trend_score,
 ) -> TradingSignal:
     entry = snap.current_price
@@ -91,6 +93,7 @@ def build_signal(
         ai_reason    = ai_reason,
         pump_score   = pump_score.total_score,
         quality_score= quality_score,
+        aggregate_score = aggregate_score,
         trend_score  = trend_score,
         volume_ratio = ind.volume_ratio,
         momentum     = ind.momentum,
@@ -164,12 +167,57 @@ def calculate_signal_quality(
     return round(max(0.0, min(100.0, quality)), 2)
 
 
+def calculate_aggregate_signal_score(
+    snap,
+    ind,
+    pump_score,
+    ai_action,
+    ai_confidence,
+    quality_score,
+    trend_info,
+) -> float:
+    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    rsi = ind.rsi or 50.0
+    above_mas = (
+        snap.current_price >= (ind.ma20 or snap.current_price)
+        and snap.current_price >= (ind.ma50 or snap.current_price)
+    )
+
+    aggregate = pump_score.total_score * 0.28
+    aggregate += quality_score * 0.34
+    aggregate += ai_confidence * 0.18
+    aggregate += min(trend_score, 60.0) * 0.10
+    aggregate += min(ind.volume_ratio, 6.0) * 2.2
+    aggregate += min(max(ind.momentum, 0.0), 20.0) * 0.55
+    aggregate += {"BUY": 8, "HOLD": -10, "AVOID": -24}.get(ai_action, -8)
+
+    if above_mas:
+        aggregate += 4
+
+    if 45 <= rsi <= 68:
+        aggregate += 4
+    elif rsi > 78:
+        aggregate -= 18
+    elif rsi > 72:
+        aggregate -= 10
+    elif rsi < 25:
+        aggregate -= 6
+
+    if snap.price_change_24h >= 18:
+        aggregate -= 8
+    elif snap.price_change_24h >= 12:
+        aggregate -= 4
+
+    return round(max(0.0, min(100.0, aggregate)), 2)
+
+
 def should_emit_signal(
     snap,
     pump_score,
     ai_action,
     ai_confidence,
     quality_score,
+    aggregate_score,
     trend_info,
 ) -> bool:
     trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
@@ -196,6 +244,13 @@ def should_emit_signal(
         logger.info(
             "Rejecting %s because quality %.1f is below %.1f",
             snap.symbol, quality_score, MIN_SIGNAL_QUALITY_SCORE,
+        )
+        return False
+
+    if aggregate_score < MIN_SIGNAL_AGGREGATE_SCORE:
+        logger.info(
+            "Rejecting %s because aggregate %.1f is below %.1f",
+            snap.symbol, aggregate_score, MIN_SIGNAL_AGGREGATE_SCORE,
         )
         return False
 
@@ -243,7 +298,7 @@ def run_cycle(
     ranked_opportunities.sort(key=lambda item: item[0], reverse=True)
 
     # ── 6. AI evaluation of top 5 opportunities ────────────────────────────
-    signals_this_cycle = 0
+    candidate_signals = []
     for _, snap, ind, pump, trend_info in ranked_opportunities[:MAX_AI_EVALUATIONS_PER_CYCLE]:
         if has_recent_pending_signal(snap.id, snap.symbol):
             logger.info("Skipping %s — recent pending signal already exists", snap.symbol)
@@ -254,9 +309,12 @@ def run_cycle(
         quality_score = calculate_signal_quality(
             snap, ind, pump, action, confidence, trend_info,
         )
+        aggregate_score = calculate_aggregate_signal_score(
+            snap, ind, pump, action, confidence, quality_score, trend_info,
+        )
 
         if not should_emit_signal(
-            snap, pump, action, confidence, quality_score, trend_info,
+            snap, pump, action, confidence, quality_score, aggregate_score, trend_info,
         ):
             continue
 
@@ -272,13 +330,26 @@ def run_cycle(
             confidence,
             reason,
             quality_score,
+            aggregate_score,
             trend_info.get("trend_score", 0.0) if trend_info else 0.0,
         )
+        candidate_signals.append(signal)
+
+    candidate_signals.sort(
+        key=lambda signal: (
+            signal.aggregate_score,
+            signal.quality_score,
+            signal.confidence,
+            signal.pump_score,
+        ),
+        reverse=True,
+    )
+
+    signals_this_cycle = 0
+    for signal in candidate_signals[:MAX_SIGNALS_PER_CYCLE]:
         save_signal(signal)
         send_signal(signal)
         signals_this_cycle += 1
-        if signals_this_cycle >= MAX_SIGNALS_PER_CYCLE:
-            break
 
     # ── 7. Check past signal outcomes ─────────────────────────────────────
     check_outcomes(price_map)

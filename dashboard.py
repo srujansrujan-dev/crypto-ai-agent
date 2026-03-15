@@ -169,6 +169,7 @@ HTML = """
       <span>Confidence: {{ best_signal.confidence | int }}%</span>
       <span>Score: {{ best_signal.pump_score | int }}/100</span>
       <span>Quality: {{ (best_signal.quality_score or best_signal.pump_score) | int }}/100</span>
+      <span>Aggregate: {{ (best_signal.aggregate_score or best_signal.quality_score or best_signal.pump_score) | int }}/100</span>
     </div>
     <p class="hero-reason">{{ best_signal.ai_reason }}</p>
   </div>
@@ -188,6 +189,7 @@ HTML = """
         <th>Confidence</th>
         <th>Score</th>
         <th>Quality</th>
+        <th>Aggregate</th>
         <th>Outcome</th>
         <th>Time (UTC)</th>
       </tr>
@@ -205,6 +207,7 @@ HTML = """
         <td>{{ s.confidence | int }}%</td>
         <td>{{ s.pump_score | int }}/100</td>
         <td>{{ (s.quality_score or s.pump_score) | int }}/100</td>
+        <td>{{ (s.aggregate_score or s.quality_score or s.pump_score) | int }}/100</td>
         <td>
           <span class="badge badge-{{ s.outcome | lower }}">{{ s.outcome }}</span>
         </td>
@@ -267,6 +270,7 @@ def _pick_best_signal(signals):
         action_priority = {"BUY": 2, "HOLD": 1, "AVOID": 0}.get(signal.get("ai_action"), 0)
         return (
             action_priority,
+            float(signal.get("aggregate_score") or 0),
             float(signal.get("quality_score") or 0),
             float(signal.get("confidence", 0)),
             float(signal.get("pump_score", 0)),
