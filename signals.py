@@ -2,9 +2,8 @@
 signals.py — Shared data models used across all modules.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-from datetime import datetime
 
 
 @dataclass
@@ -62,6 +61,13 @@ class TradingSignal:
     ai_action:       str               # BUY / HOLD / AVOID
     ai_reason:       str
     pump_score:      float
+    quality_score:   float
+    trend_score:     float
+    volume_ratio:    float
+    momentum:        float
+    rsi:             float
+    market_cap:      float
+    price_change_24h: float
     outcome:         str = "PENDING"   # PENDING / WIN / LOSS / NEUTRAL
     outcome_price:   Optional[float] = None
     outcome_checked: bool = False

@@ -139,6 +139,117 @@ def _fallback_analysis(pump: PumpScore, indicators: IndicatorSet) -> Tuple[str, 
         return "HOLD", 40.0, "Moderate signal — insufficient evidence for strong conviction."
 
 
+def _smart_fallback_analysis(
+    snapshot: MarketSnapshot,
+    indicators: IndicatorSet,
+    pump: PumpScore,
+    trend_info: Optional[dict] = None,
+) -> Tuple[str, float, str]:
+    """Rule-based fallback when Gemini is unavailable."""
+    score = pump.total_score
+    rsi = indicators.rsi or 50.0
+    volume_ratio = indicators.volume_ratio
+    momentum = indicators.momentum
+    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    ma20 = indicators.ma20 or snapshot.current_price
+    ma50 = indicators.ma50 or snapshot.current_price
+    above_mas = snapshot.current_price >= ma20 and snapshot.current_price >= ma50
+
+    confidence = 30.0
+    bullish_points = 0
+    strengths = []
+    cautions = []
+
+    if score >= 95:
+        confidence += 16
+        bullish_points += 2
+        strengths.append("pump score is exceptional")
+    elif score >= 85:
+        confidence += 10
+        bullish_points += 1
+        strengths.append("pump score is strong")
+
+    if volume_ratio >= 5:
+        confidence += 12
+        bullish_points += 2
+        strengths.append("volume is surging")
+    elif volume_ratio >= 3:
+        confidence += 8
+        bullish_points += 1
+        strengths.append("volume is above baseline")
+
+    if momentum >= 15:
+        confidence += 10
+        bullish_points += 2
+        strengths.append("momentum is accelerating")
+    elif momentum >= 8:
+        confidence += 6
+        bullish_points += 1
+        strengths.append("momentum is positive")
+
+    if trend_score >= 45:
+        confidence += 10
+        bullish_points += 2
+        strengths.append("trend strength is building")
+    elif trend_score >= 25:
+        confidence += 5
+        bullish_points += 1
+        strengths.append("trend support is present")
+
+    if above_mas:
+        confidence += 5
+        bullish_points += 1
+        strengths.append("price is above key moving averages")
+    else:
+        cautions.append("price is not cleanly above MA20 and MA50")
+
+    if 45 <= rsi <= 68:
+        confidence += 6
+        bullish_points += 1
+        strengths.append("RSI is not overheated")
+    elif rsi > 78:
+        confidence -= 18
+        cautions.append("RSI is heavily overbought")
+    elif rsi > 72:
+        confidence -= 10
+        cautions.append("RSI is getting stretched")
+    elif rsi < 28:
+        confidence -= 6
+        cautions.append("RSI is deeply oversold")
+
+    if snapshot.price_change_24h >= 20:
+        confidence -= 10
+        cautions.append("the 24h move is already extended")
+    elif snapshot.price_change_24h >= 12:
+        confidence -= 5
+        cautions.append("the 24h move is somewhat extended")
+
+    if snapshot.market_cap <= 0:
+        confidence -= 4
+        cautions.append("market cap data is missing")
+
+    confidence = max(5.0, min(95.0, confidence))
+
+    if bullish_points >= 7 and confidence >= 58 and rsi < 72:
+        action = "BUY"
+    elif rsi >= 78 or confidence < 35:
+        action = "AVOID"
+    elif score >= 80 and confidence >= 48:
+        action = "HOLD"
+    else:
+        action = "AVOID"
+
+    reason_parts = []
+    if strengths:
+        reason_parts.append(f"Strengths: {', '.join(strengths[:3])}.")
+    if cautions:
+        reason_parts.append(f"Caution: {', '.join(cautions[:2])}.")
+    if not reason_parts:
+        reason_parts.append("Setup is mixed and lacks enough aligned signals.")
+
+    return action, round(confidence, 1), " ".join(reason_parts)
+
+
 def analyse(
     snapshot:   MarketSnapshot,
     indicators: IndicatorSet,
@@ -153,12 +264,12 @@ def analyse(
     disabled_reason = _ai_disabled_reason()
     if disabled_reason:
         logger.warning("AI unavailable for %s — using fallback: %s", snapshot.symbol, disabled_reason)
-        return _fallback_analysis(pump, indicators)
+        return _smart_fallback_analysis(snapshot, indicators, pump, trend_info)
 
     model = _get_model()
     if not model:
         logger.warning("No Gemini model — using fallback heuristics for %s.", snapshot.symbol)
-        return _fallback_analysis(pump, indicators)
+        return _smart_fallback_analysis(snapshot, indicators, pump, trend_info)
 
     prompt = _build_prompt(snapshot, indicators, pump, trend_info)
 
@@ -216,4 +327,4 @@ def analyse(
                 time.sleep(5)
 
     logger.warning("All Gemini attempts failed — using fallback for %s.", snapshot.symbol)
-    return _fallback_analysis(pump, indicators)
+    return _smart_fallback_analysis(snapshot, indicators, pump, trend_info)

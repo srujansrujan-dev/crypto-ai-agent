@@ -4,3 +4,4 @@ google-generativeai
 python-dotenv
 numpy
 pandas
+psycopg[binary]

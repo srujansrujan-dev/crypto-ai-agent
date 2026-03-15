@@ -19,10 +19,16 @@ import time
 from datetime import datetime, timezone
 
 from config import (
+    ALLOWED_SIGNAL_ACTIONS,
     DEFAULT_STOP_LOSS_PCT,
     DEFAULT_TARGET_PCT,
     LOG_FILE,
     MAX_AI_EVALUATIONS_PER_CYCLE,
+    MAX_SIGNALS_PER_CYCLE,
+    MIN_SIGNAL_CONFIDENCE,
+    MIN_SIGNAL_PUMP_SCORE,
+    MIN_SIGNAL_QUALITY_SCORE,
+    MIN_SIGNAL_TREND_SCORE,
     SCAN_INTERVAL_SECONDS,
 )
 from scanner        import fetch_market_data
@@ -60,7 +66,14 @@ logger = logging.getLogger(__name__)
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 def build_signal(
-    snap, ind, pump_score, ai_action, ai_confidence, ai_reason
+    snap,
+    ind,
+    pump_score,
+    ai_action,
+    ai_confidence,
+    ai_reason,
+    quality_score,
+    trend_score,
 ) -> TradingSignal:
     entry = snap.current_price
     return TradingSignal(
@@ -77,7 +90,123 @@ def build_signal(
         ai_action    = ai_action,
         ai_reason    = ai_reason,
         pump_score   = pump_score.total_score,
+        quality_score= quality_score,
+        trend_score  = trend_score,
+        volume_ratio = ind.volume_ratio,
+        momentum     = ind.momentum,
+        rsi          = float(ind.rsi or 50.0),
+        market_cap   = snap.market_cap,
+        price_change_24h = snap.price_change_24h,
     )
+
+
+def rank_opportunity(snap, ind, pump_score, trend_info) -> float:
+    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    rsi = ind.rsi or 50.0
+    above_mas = (
+        snap.current_price >= (ind.ma20 or snap.current_price)
+        and snap.current_price >= (ind.ma50 or snap.current_price)
+    )
+
+    score = pump_score.total_score
+    score += min(ind.volume_ratio, 6.0) * 2.5
+    score += min(max(ind.momentum, 0.0), 20.0)
+    score += min(trend_score, 60.0) * 0.2
+    if above_mas:
+        score += 6
+    if 45 <= rsi <= 68:
+        score += 6
+    elif rsi > 78:
+        score -= 18
+    elif rsi > 72:
+        score -= 10
+    score -= min(max(snap.price_change_24h - 18.0, 0.0), 12.0) * 0.8
+    return round(score, 2)
+
+
+def calculate_signal_quality(
+    snap,
+    ind,
+    pump_score,
+    ai_action,
+    ai_confidence,
+    trend_info,
+) -> float:
+    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    rsi = ind.rsi or 50.0
+    above_mas = (
+        snap.current_price >= (ind.ma20 or snap.current_price)
+        and snap.current_price >= (ind.ma50 or snap.current_price)
+    )
+
+    quality = pump_score.total_score * 0.42 + ai_confidence * 0.33
+    quality += min(ind.volume_ratio / 5.0, 1.0) * 10
+    quality += min(max(ind.momentum, 0.0) / 18.0, 1.0) * 10
+    quality += min(trend_score / 60.0, 1.0) * 12
+    quality += {"BUY": 12, "HOLD": -8, "AVOID": -20}.get(ai_action, 0)
+
+    if above_mas:
+        quality += 6
+
+    if rsi > 78:
+        quality -= 18
+    elif rsi > 72:
+        quality -= 10
+    elif rsi < 25:
+        quality -= 8
+    elif 45 <= rsi <= 68:
+        quality += 6
+
+    quality -= min(max(snap.price_change_24h - 15.0, 0.0), 15.0) * 0.6
+    if snap.market_cap <= 0:
+        quality -= 4
+
+    return round(max(0.0, min(100.0, quality)), 2)
+
+
+def should_emit_signal(
+    snap,
+    pump_score,
+    ai_action,
+    ai_confidence,
+    quality_score,
+    trend_info,
+) -> bool:
+    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+
+    if ai_action not in ALLOWED_SIGNAL_ACTIONS:
+        logger.info("Rejecting %s because action %s is below the signal bar", snap.symbol, ai_action)
+        return False
+
+    if ai_confidence < MIN_SIGNAL_CONFIDENCE:
+        logger.info(
+            "Rejecting %s because confidence %.1f is below %.1f",
+            snap.symbol, ai_confidence, MIN_SIGNAL_CONFIDENCE,
+        )
+        return False
+
+    if pump_score.total_score < MIN_SIGNAL_PUMP_SCORE:
+        logger.info(
+            "Rejecting %s because pump score %.1f is below %.1f",
+            snap.symbol, pump_score.total_score, MIN_SIGNAL_PUMP_SCORE,
+        )
+        return False
+
+    if quality_score < MIN_SIGNAL_QUALITY_SCORE:
+        logger.info(
+            "Rejecting %s because quality %.1f is below %.1f",
+            snap.symbol, quality_score, MIN_SIGNAL_QUALITY_SCORE,
+        )
+        return False
+
+    if trend_info and trend_score < MIN_SIGNAL_TREND_SCORE and pump_score.total_score < 95:
+        logger.info(
+            "Rejecting %s because trend score %.1f is below %.1f",
+            snap.symbol, trend_score, MIN_SIGNAL_TREND_SCORE,
+        )
+        return False
+
+    return True
 
 
 def run_cycle(
@@ -105,25 +234,51 @@ def run_cycle(
     # ── 5. Pump detection scan ─────────────────────────────────────────────
     opportunities = detector.scan(snapshots, indicators)
     logger.info("Opportunities flagged: %d", len(opportunities))
+    ranked_opportunities = []
+    for snap, ind, pump in opportunities:
+        trend_info = trends.evaluate(snap.id)
+        ranked_opportunities.append(
+            (rank_opportunity(snap, ind, pump, trend_info), snap, ind, pump, trend_info)
+        )
+    ranked_opportunities.sort(key=lambda item: item[0], reverse=True)
 
     # ── 6. AI evaluation of top 5 opportunities ────────────────────────────
     signals_this_cycle = 0
-    for snap, ind, pump in opportunities[:MAX_AI_EVALUATIONS_PER_CYCLE]:
+    for _, snap, ind, pump, trend_info in ranked_opportunities[:MAX_AI_EVALUATIONS_PER_CYCLE]:
         if has_recent_pending_signal(snap.id, snap.symbol):
             logger.info("Skipping %s — recent pending signal already exists", snap.symbol)
             continue
 
         trend_info = trends.evaluate(snap.id)
         action, confidence, reason = analyse(snap, ind, pump, trend_info)
+        quality_score = calculate_signal_quality(
+            snap, ind, pump, action, confidence, trend_info,
+        )
+
+        if not should_emit_signal(
+            snap, pump, action, confidence, quality_score, trend_info,
+        ):
+            continue
 
         if action == "AVOID":
             logger.info("Skipping %s — AI says AVOID", snap.symbol)
             continue
 
-        signal = build_signal(snap, ind, pump, action, confidence, reason)
+        signal = build_signal(
+            snap,
+            ind,
+            pump,
+            action,
+            confidence,
+            reason,
+            quality_score,
+            trend_info.get("trend_score", 0.0) if trend_info else 0.0,
+        )
         save_signal(signal)
         send_signal(signal)
         signals_this_cycle += 1
+        if signals_this_cycle >= MAX_SIGNALS_PER_CYCLE:
+            break
 
     # ── 7. Check past signal outcomes ─────────────────────────────────────
     check_outcomes(price_map)
