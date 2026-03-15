@@ -20,6 +20,32 @@ from signals import IndicatorSet, MarketSnapshot, PumpScore
 MAJOR_SYMBOLS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _weighted_average(rows: List[dict], value_key: str, weight_key: str) -> float:
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for row in rows:
+        weight = max(_safe_float(row.get(weight_key), 1.0), 1.0)
+        value = _safe_float(row.get(value_key), 0.0)
+        weighted_sum += value * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return 0.0
+    return weighted_sum / total_weight
+
+
+def _normalise_symbol(text: str) -> str:
+    return "".join(ch for ch in str(text).upper() if ch.isalnum())
+
+
 def classify_market_regime(snapshots: List[MarketSnapshot]) -> dict:
     """Classify the current market regime from broad cross-sectional behavior."""
     liquid = [snap for snap in snapshots if snap.current_price > 0 and snap.total_volume > 0]
@@ -251,6 +277,7 @@ def calculate_final_publish_score(
     prior_final_score: float,
     deep_context: dict,
     regime: dict,
+    futures_context: Optional[dict] = None,
 ) -> float:
     """Final decision score used for the published signal only."""
     score = prior_final_score * 0.42
@@ -260,6 +287,15 @@ def calculate_final_publish_score(
     score += deep_context.get("liquidity_score", 0.0) * 0.08
     score += regime.get("score", 50.0) * 0.05
 
+    if futures_context and futures_context.get("has_data"):
+        score += futures_context.get("futures_score", 0.0) * 0.09
+        if futures_context.get("trade_bias") == "LONG":
+            score += 4
+        elif futures_context.get("trade_bias") == "SHORT":
+            score -= 12
+        else:
+            score -= 4
+
     if ai_action != "BUY":
         score -= 18
     if regime.get("label") == "PANIC" and snapshot.symbol not in MAJOR_SYMBOLS:
@@ -268,5 +304,163 @@ def calculate_final_publish_score(
         score -= 7
 
     score -= min(deep_context.get("risk_score", 0.0), 100.0) * 0.08
+    if futures_context and abs(futures_context.get("spread", 0.0)) >= 1.5:
+        score -= 6
     return round(max(0.0, min(100.0, score)), 2)
 
+
+def summarize_futures_context(
+    snapshot: MarketSnapshot,
+    regime: dict,
+    derivatives: Optional[List[dict]],
+) -> dict:
+    """
+    Summarise live derivatives context for a spot symbol.
+
+    This is a real futures-data layer driven by CoinGecko's derivatives feed.
+    It does not force a decision when futures coverage is missing; instead it
+    returns a neutral NO-DATA state so the rest of the system can degrade
+    gracefully.
+    """
+    rows = derivatives or []
+    if not rows:
+        return {
+            "has_data": False,
+            "trade_bias": "NO-DATA",
+            "leverage_hint": "1x",
+            "futures_exchange": "",
+            "futures_symbol": "",
+            "funding_rate": 0.0,
+            "open_interest": 0.0,
+            "basis": 0.0,
+            "spread": 0.0,
+            "futures_volume_24h": 0.0,
+            "futures_score": 0.0,
+            "notes": ["no derivatives coverage found"],
+        }
+
+    symbol_key = _normalise_symbol(snapshot.symbol)
+    matches = []
+    for row in rows:
+        if row.get("expired_at"):
+            continue
+        index_id = _normalise_symbol(row.get("index_id", ""))
+        derivative_symbol = _normalise_symbol(row.get("symbol", ""))
+        if index_id == symbol_key or derivative_symbol.startswith(symbol_key):
+            matches.append(row)
+
+    if not matches:
+        return {
+            "has_data": False,
+            "trade_bias": "NO-DATA",
+            "leverage_hint": "1x",
+            "futures_exchange": "",
+            "futures_symbol": "",
+            "funding_rate": 0.0,
+            "open_interest": 0.0,
+            "basis": 0.0,
+            "spread": 0.0,
+            "futures_volume_24h": 0.0,
+            "futures_score": 0.0,
+            "notes": ["no active derivatives market found for this symbol"],
+        }
+
+    perpetuals = [
+        row
+        for row in matches
+        if "perpetual" in str(row.get("contract_type", "")).lower()
+    ]
+    if perpetuals:
+        matches = perpetuals
+
+    matches.sort(key=lambda row: _safe_float(row.get("volume_24h")), reverse=True)
+    top = matches[:5]
+
+    futures_volume_24h = sum(max(_safe_float(row.get("volume_24h")), 0.0) for row in top)
+    open_interest = sum(max(_safe_float(row.get("open_interest")), 0.0) for row in top)
+    funding_rate = _weighted_average(top, "funding_rate", "volume_24h")
+    basis = _weighted_average(top, "basis", "volume_24h")
+    spread = _weighted_average(top, "spread", "volume_24h")
+    futures_price_change = _weighted_average(top, "price_change_24h", "volume_24h")
+
+    score = 44.0
+    notes: List[str] = []
+
+    if futures_volume_24h >= 500_000_000:
+        score += 18
+        notes.append("strong derivatives volume")
+    elif futures_volume_24h >= 100_000_000:
+        score += 12
+        notes.append("healthy derivatives volume")
+    elif futures_volume_24h >= 20_000_000:
+        score += 6
+        notes.append("moderate derivatives volume")
+
+    if open_interest >= 250_000_000:
+        score += 12
+        notes.append("deep open interest")
+    elif open_interest >= 50_000_000:
+        score += 7
+    elif open_interest <= 1_000_000:
+        score -= 6
+        notes.append("open interest is thin")
+
+    spread_abs = abs(spread)
+    if spread_abs <= 0.20:
+        score += 8
+    elif spread_abs <= 0.50:
+        score += 4
+    elif spread_abs >= 1.50:
+        score -= 8
+        notes.append("spread is wide")
+
+    if basis >= 0 and snapshot.price_change_24h > 0:
+        score += 5
+        notes.append("basis supports bullish continuation")
+    elif basis < 0 and snapshot.price_change_24h > 0:
+        score -= 6
+        notes.append("basis is weak versus spot strength")
+    elif basis < 0 and snapshot.price_change_24h < 0:
+        score += 3
+
+    if -0.02 <= funding_rate <= 0.02:
+        score += 6
+    elif abs(funding_rate) >= 0.10:
+        score -= 8
+        notes.append("funding looks crowded")
+
+    regime_label = regime.get("label", "UNKNOWN")
+    if regime_label == "RISK_ON" and snapshot.price_change_24h > 0:
+        score += 4
+    elif regime_label in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
+        score -= 6
+
+    if snapshot.price_change_24h > 0 and futures_price_change >= 0 and basis >= -0.10 and funding_rate > -0.03:
+        trade_bias = "LONG"
+    elif snapshot.price_change_24h < 0 and futures_price_change <= 0 and basis <= 0 and funding_rate < 0:
+        trade_bias = "SHORT"
+    else:
+        trade_bias = "NO-TRADE"
+
+    if trade_bias == "LONG" and score >= 78 and spread_abs <= 0.30:
+        leverage_hint = "3x"
+    elif trade_bias == "LONG" and score >= 62:
+        leverage_hint = "2x"
+    else:
+        leverage_hint = "1x"
+
+    lead = top[0]
+    return {
+        "has_data": True,
+        "trade_bias": trade_bias,
+        "leverage_hint": leverage_hint,
+        "futures_exchange": str(lead.get("market") or ""),
+        "futures_symbol": str(lead.get("symbol") or snapshot.symbol),
+        "funding_rate": round(funding_rate, 6),
+        "open_interest": round(open_interest, 2),
+        "basis": round(basis, 4),
+        "spread": round(spread, 4),
+        "futures_volume_24h": round(futures_volume_24h, 2),
+        "futures_score": round(max(0.0, min(100.0, score)), 2),
+        "notes": notes[:3],
+    }

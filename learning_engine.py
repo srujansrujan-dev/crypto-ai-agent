@@ -66,6 +66,16 @@ _SIGNAL_COLUMN_TYPES = {
     "rsi": "REAL DEFAULT 50",
     "market_cap": "REAL DEFAULT 0",
     "price_change_24h": "REAL DEFAULT 0",
+    "futures_bias": "TEXT DEFAULT 'NO-DATA'",
+    "leverage_hint": "TEXT DEFAULT '1x'",
+    "futures_exchange": "TEXT DEFAULT ''",
+    "futures_symbol": "TEXT DEFAULT ''",
+    "funding_rate": "REAL DEFAULT 0",
+    "open_interest": "REAL DEFAULT 0",
+    "basis": "REAL DEFAULT 0",
+    "spread": "REAL DEFAULT 0",
+    "futures_volume_24h": "REAL DEFAULT 0",
+    "futures_score": "REAL DEFAULT 0",
     "outcome": "TEXT DEFAULT 'PENDING'",
     "outcome_price": "REAL",
     "outcome_checked": "INTEGER DEFAULT 0",
@@ -160,6 +170,16 @@ def _ensure_sqlite_schema(conn) -> None:
             rsi              REAL    DEFAULT 50,
             market_cap       REAL    DEFAULT 0,
             price_change_24h REAL    DEFAULT 0,
+            futures_bias     TEXT    DEFAULT 'NO-DATA',
+            leverage_hint    TEXT    DEFAULT '1x',
+            futures_exchange TEXT    DEFAULT '',
+            futures_symbol   TEXT    DEFAULT '',
+            funding_rate     REAL    DEFAULT 0,
+            open_interest    REAL    DEFAULT 0,
+            basis            REAL    DEFAULT 0,
+            spread           REAL    DEFAULT 0,
+            futures_volume_24h REAL  DEFAULT 0,
+            futures_score    REAL    DEFAULT 0,
             outcome          TEXT    DEFAULT 'PENDING',
             outcome_price    REAL,
             outcome_checked  INTEGER DEFAULT 0
@@ -216,6 +236,16 @@ def _ensure_postgres_schema(conn) -> None:
             rsi              DOUBLE PRECISION DEFAULT 50,
             market_cap       DOUBLE PRECISION DEFAULT 0,
             price_change_24h DOUBLE PRECISION DEFAULT 0,
+            futures_bias     TEXT DEFAULT 'NO-DATA',
+            leverage_hint    TEXT DEFAULT '1x',
+            futures_exchange TEXT DEFAULT '',
+            futures_symbol   TEXT DEFAULT '',
+            funding_rate     DOUBLE PRECISION DEFAULT 0,
+            open_interest    DOUBLE PRECISION DEFAULT 0,
+            basis            DOUBLE PRECISION DEFAULT 0,
+            spread           DOUBLE PRECISION DEFAULT 0,
+            futures_volume_24h DOUBLE PRECISION DEFAULT 0,
+            futures_score    DOUBLE PRECISION DEFAULT 0,
             outcome          TEXT DEFAULT 'PENDING',
             outcome_price    DOUBLE PRECISION,
             outcome_checked  BOOLEAN DEFAULT FALSE
@@ -289,6 +319,16 @@ def _signal_payload(signal: TradingSignal):
         signal.rsi,
         signal.market_cap,
         signal.price_change_24h,
+        signal.futures_bias,
+        signal.leverage_hint,
+        signal.futures_exchange,
+        signal.futures_symbol,
+        signal.funding_rate,
+        signal.open_interest,
+        signal.basis,
+        signal.spread,
+        signal.futures_volume_24h,
+        signal.futures_score,
         signal.outcome,
         signal.outcome_price,
         bool(signal.outcome_checked),
@@ -305,7 +345,9 @@ def save_signal(signal: TradingSignal) -> int:
             "stop_loss, buy_zone_low, buy_zone_high, confidence, ai_action, "
             "ai_reason, pump_score, quality_score, aggregate_score, deep_score, "
             "liquidity_score, risk_score, market_regime, regime_score, trend_score, volume_ratio, "
-            "momentum, rsi, market_cap, price_change_24h, outcome, "
+            "momentum, rsi, market_cap, price_change_24h, futures_bias, leverage_hint, "
+            "futures_exchange, futures_symbol, funding_rate, open_interest, basis, spread, "
+            "futures_volume_24h, futures_score, outcome, "
             "outcome_price, outcome_checked"
         )
         payload = _signal_payload(signal)
@@ -414,20 +456,33 @@ def update_signal_outcome(signal_id: int, outcome: str, price: float) -> None:
         conn.close()
 
 
-def get_recent_signals(limit: int = 50) -> List[dict]:
-    """Fetch recent signals for the dashboard."""
+def get_recent_signals(
+    limit: int = 50,
+    offset: int = 0,
+    outcome: Optional[str] = None,
+) -> List[dict]:
+    """Fetch recent signals for the dashboard or history views."""
     conn, backend = _connect(row_factory=True)
     try:
         cur = conn.cursor()
+        where_clause = ""
+        params: List = []
+        placeholder = "%s" if backend == "postgres" else "?"
+        if outcome:
+            where_clause = f"WHERE outcome = {placeholder}"
+            params.append(outcome)
+
         if backend == "postgres":
+            params.extend([limit, offset])
             cur.execute(
-                "SELECT * FROM signals ORDER BY id DESC LIMIT %s",
-                (limit,),
+                f"SELECT * FROM signals {where_clause} ORDER BY id DESC LIMIT %s OFFSET %s",
+                tuple(params),
             )
         else:
+            params.extend([limit, offset])
             cur.execute(
-                "SELECT * FROM signals ORDER BY id DESC LIMIT ?",
-                (limit,),
+                f"SELECT * FROM signals {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                tuple(params),
             )
         return _rows_to_dicts(cur.fetchall())
     finally:
@@ -462,9 +517,22 @@ def get_stats() -> dict:
         "losses": losses,
         "neutral": neutral,
         "pending": pending,
+        "closed": closed,
         "total": closed + pending,
         "win_rate": round(win_rate, 1),
     }
+
+
+def get_storage_backend_name() -> str:
+    """Best-effort backend label for dashboard visibility."""
+    if _should_use_postgres():
+        try:
+            conn = _postgres_connect()
+            conn.close()
+            return "Postgres"
+        except Exception:
+            pass
+    return "SQLite"
 
 
 def _load_weights_from_file() -> dict:

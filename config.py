@@ -30,6 +30,7 @@ WATCHLIST_DEEP_LIMIT         = 8
 WATCHLIST_LOG_LIMIT          = 5
 AI_QUOTA_COOLDOWN_SECONDS    = 6 * 60 * 60
 AI_MODEL_COOLDOWN_SECONDS    = 24 * 60 * 60
+FUTURES_CACHE_TTL_SECONDS    = 10 * 60
 
 # ── Scoring weights (learning engine updates data/weights.json at runtime) ────
 DEFAULT_WEIGHTS = {
@@ -47,6 +48,7 @@ MIN_SIGNAL_TREND_SCORE      = 25.0
 MIN_SIGNAL_FINAL_SCORE      = 82.0
 MIN_SIGNAL_LIQUIDITY_SCORE  = 28.0
 MAX_SIGNAL_RISK_SCORE       = 72.0
+MIN_FUTURES_CONFIRMATION    = 48.0
 
 # ── Signal risk defaults ──────────────────────────────────────────────────────
 DEFAULT_STOP_LOSS_PCT = 0.05
@@ -69,3 +71,5 @@ MA_LONG    = 50
 # ── Web dashboard ─────────────────────────────────────────────────────────────
 DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = int(os.getenv("PORT", 8080))
+LATEST_SIGNALS_LIMIT = 10
+HISTORY_SIGNALS_LIMIT = 250

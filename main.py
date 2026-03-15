@@ -27,6 +27,7 @@ from config import (
     MAX_AI_EVALUATIONS_PER_CYCLE,
     MAX_SIGNALS_PER_CYCLE,
     MAX_SIGNAL_RISK_SCORE,
+    MIN_FUTURES_CONFIRMATION,
     MIN_SIGNAL_CONFIDENCE,
     MIN_SIGNAL_FINAL_SCORE,
     MIN_SIGNAL_LIQUIDITY_SCORE,
@@ -54,9 +55,10 @@ from market_intelligence import (
     calculate_final_publish_score,
     classify_market_regime,
     score_watchlist_candidate,
+    summarize_futures_context,
 )
 from pump_detector import PumpDetector
-from scanner import fetch_coin_market_chart, fetch_market_data
+from scanner import fetch_coin_market_chart, fetch_derivatives_tickers, fetch_market_data
 from signals import TradingSignal
 from trend_detector import TrendDetector
 
@@ -83,6 +85,7 @@ def build_signal(
     quality_score,
     final_score,
     deep_context,
+    futures_context,
     regime,
     trend_score,
 ) -> TradingSignal:
@@ -96,6 +99,13 @@ def build_signal(
     risk_notes = deep_context.get("risk_notes") or []
     if risk_notes:
         context_suffix += f" Note: {risk_notes[0]}."
+    if futures_context.get("has_data"):
+        context_suffix += (
+            f" Futures: {futures_context.get('trade_bias', 'NO-DATA')} bias, "
+            f"{futures_context.get('leverage_hint', '1x')} leverage hint, "
+            f"funding {futures_context.get('funding_rate', 0.0):.4f}, "
+            f"OI {futures_context.get('open_interest', 0.0):,.0f}."
+        )
 
     return TradingSignal(
         asset_id=snap.id,
@@ -124,6 +134,16 @@ def build_signal(
         rsi=float(ind.rsi or 50.0),
         market_cap=snap.market_cap,
         price_change_24h=snap.price_change_24h,
+        futures_bias=futures_context.get("trade_bias", "NO-DATA"),
+        leverage_hint=futures_context.get("leverage_hint", "1x"),
+        futures_exchange=futures_context.get("futures_exchange", ""),
+        futures_symbol=futures_context.get("futures_symbol", ""),
+        funding_rate=futures_context.get("funding_rate", 0.0),
+        open_interest=futures_context.get("open_interest", 0.0),
+        basis=futures_context.get("basis", 0.0),
+        spread=futures_context.get("spread", 0.0),
+        futures_volume_24h=futures_context.get("futures_volume_24h", 0.0),
+        futures_score=futures_context.get("futures_score", 0.0),
     )
 
 
@@ -243,6 +263,7 @@ def should_emit_signal(
     quality_score,
     final_score,
     deep_context,
+    futures_context,
     regime,
     trend_info,
 ) -> bool:
@@ -250,6 +271,8 @@ def should_emit_signal(
     liquidity_score = deep_context.get("liquidity_score", 0.0)
     risk_score = deep_context.get("risk_score", 0.0)
     market_regime = regime.get("label", "UNKNOWN")
+    futures_bias = futures_context.get("trade_bias", "NO-DATA")
+    futures_score = futures_context.get("futures_score", 0.0)
 
     if ai_action not in ALLOWED_SIGNAL_ACTIONS:
         logger.info("Rejecting %s because action %s is below the signal bar", snap.symbol, ai_action)
@@ -307,6 +330,19 @@ def should_emit_signal(
     if market_regime == "PANIC" and snap.symbol not in {"BTC", "ETH", "SOL"}:
         logger.info("Rejecting %s because market regime is PANIC", snap.symbol)
         return False
+
+    if futures_context.get("has_data"):
+        if futures_bias == "SHORT":
+            logger.info("Rejecting %s because futures bias is SHORT", snap.symbol)
+            return False
+        if futures_bias == "NO-TRADE" and futures_score < MIN_FUTURES_CONFIRMATION:
+            logger.info(
+                "Rejecting %s because futures confirmation %.1f is below %.1f",
+                snap.symbol,
+                futures_score,
+                MIN_FUTURES_CONFIRMATION,
+            )
+            return False
 
     return True
 
@@ -382,6 +418,8 @@ def run_cycle(
         )
         logger.info("Internal watchlist â€” %s", top_watchlist)
 
+    derivatives = fetch_derivatives_tickers() if watchlist else []
+
     candidate_signals = []
     for candidate in watchlist[:MAX_AI_EVALUATIONS_PER_CYCLE]:
         snap = candidate["snapshot"]
@@ -389,6 +427,7 @@ def run_cycle(
         pump = candidate["pump"]
         trend_info = candidate["trend_info"]
         deep_context = candidate["deep_context"]
+        futures_context = summarize_futures_context(snap, market_regime, derivatives)
 
         if has_recent_pending_signal(snap.id, snap.symbol):
             logger.info("Skipping %s â€” recent pending signal already exists", snap.symbol)
@@ -409,6 +448,7 @@ def run_cycle(
             base_final_score,
             deep_context,
             market_regime,
+            futures_context,
         )
 
         if not should_emit_signal(
@@ -419,6 +459,7 @@ def run_cycle(
             quality_score,
             final_score,
             deep_context,
+            futures_context,
             market_regime,
             trend_info,
         ):
@@ -438,6 +479,7 @@ def run_cycle(
             quality_score,
             final_score,
             deep_context,
+            futures_context,
             market_regime,
             trend_info.get("trend_score", 0.0) if trend_info else 0.0,
         )

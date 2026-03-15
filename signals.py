@@ -74,6 +74,16 @@ class TradingSignal:
     rsi:             float
     market_cap:      float
     price_change_24h: float
+    futures_bias:    str = "NO-DATA"
+    leverage_hint:   str = "1x"
+    futures_exchange: str = ""
+    futures_symbol:  str = ""
+    funding_rate:    float = 0.0
+    open_interest:   float = 0.0
+    basis:           float = 0.0
+    spread:          float = 0.0
+    futures_volume_24h: float = 0.0
+    futures_score:   float = 0.0
     outcome:         str = "PENDING"   # PENDING / WIN / LOSS / NEUTRAL
     outcome_price:   Optional[float] = None
     outcome_checked: bool = False

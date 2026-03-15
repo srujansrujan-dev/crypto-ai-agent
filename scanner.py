@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 
 from config import (
     COINGECKO_BASE_URL, COINGECKO_API_KEY,
-    COINS_PER_CYCLE, COINGECKO_PAGE_SIZE,
+    COINS_PER_CYCLE, COINGECKO_PAGE_SIZE, FUTURES_CACHE_TTL_SECONDS,
 )
 from signals import MarketSnapshot
 
@@ -23,6 +23,16 @@ COINDCX_BASE_URL = "https://api.coindcx.com"
 REQUEST_DELAY    = 2.5
 _MARKET_CHART_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKET_CHART_TTL_SECONDS = 15 * 60
+_DERIVATIVES_CACHE: Dict[str, Any] = {"fetched_at": 0.0, "payload": []}
+
+
+def _coerce_float(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _cg_get(endpoint: str, params: dict, retries: int = 3) -> Optional[Any]:
@@ -200,6 +210,53 @@ def fetch_coin_market_chart(coin_id: str, days: int = 7) -> Dict[str, List[float
         "payload": payload,
     }
     return payload
+
+
+def fetch_derivatives_tickers() -> List[Dict[str, Any]]:
+    """
+    Fetch live derivatives tickers from CoinGecko and cache them briefly.
+
+    This powers the futures confirmation layer with funding, open interest,
+    basis, spread, and 24h derivatives volume when available.
+    """
+    now = time.time()
+    cached = _DERIVATIVES_CACHE.get("payload") or []
+    if cached and now - float(_DERIVATIVES_CACHE.get("fetched_at") or 0.0) < FUTURES_CACHE_TTL_SECONDS:
+        return cached
+
+    data = _cg_get("/derivatives", {})
+    if not isinstance(data, list):
+        return cached
+
+    tickers: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+
+        tickers.append(
+            {
+                "symbol": symbol,
+                "index_id": str(row.get("index_id") or row.get("index_name") or "").upper(),
+                "market": str(row.get("market") or row.get("name") or ""),
+                "contract_type": str(row.get("contract_type") or ""),
+                "price": _coerce_float(row.get("price")),
+                "price_change_24h": _coerce_float(row.get("price_percentage_change_24h")),
+                "funding_rate": _coerce_float(row.get("funding_rate")),
+                "open_interest": _coerce_float(row.get("open_interest")),
+                "volume_24h": _coerce_float(row.get("volume_24h")),
+                "basis": _coerce_float(row.get("basis")),
+                "spread": _coerce_float(row.get("spread")),
+                "expired_at": row.get("expired_at"),
+            }
+        )
+
+    _DERIVATIVES_CACHE["fetched_at"] = now
+    _DERIVATIVES_CACHE["payload"] = tickers
+    logger.info("[CoinGecko] Fetched %d derivative tickers", len(tickers))
+    return tickers
 
 
 def fetch_coin_history(coin_id: str, days: int = 30) -> List[Dict]:
