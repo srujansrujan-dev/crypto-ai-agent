@@ -67,6 +67,14 @@ def _action_matches_bias(action: str, bias: str) -> bool:
     )
 
 
+def _range_position(snapshot: MarketSnapshot) -> float:
+    high = _safe_float(snapshot.high_24h, snapshot.current_price)
+    low = _safe_float(snapshot.low_24h, snapshot.current_price)
+    if high <= low:
+        return 0.5
+    return _clamp((snapshot.current_price - low) / (high - low), 0.0, 1.0)
+
+
 def _weighted_average(rows: List[dict], value_key: str, weight_key: str) -> float:
     total_weight = 0.0
     weighted_sum = 0.0
@@ -402,6 +410,206 @@ def calculate_final_publish_score(
     if futures_context and abs(futures_context.get("spread", 0.0)) >= 1.5:
         score -= 6
     return round(max(0.0, min(100.0, score)), 2)
+
+
+def calculate_shadow_trade_eval(
+    snapshot: MarketSnapshot,
+    indicators: IndicatorSet,
+    pump: PumpScore,
+    trend_info: Optional[dict],
+    deep_context: dict,
+    regime: dict,
+    futures_context: Optional[dict],
+    live_action: str,
+    live_confidence: float,
+    live_final_score: float,
+) -> dict:
+    """
+    Experimental background-only scoring model.
+
+    This does not affect signal publication. It is saved beside live signals so
+    we can compare how a richer directional model would have behaved.
+    """
+    long_pump = _safe_float(getattr(pump, "long_score", pump.total_score), pump.total_score)
+    short_pump = _safe_float(getattr(pump, "short_score", pump.total_score), pump.total_score)
+    long_trend = _directional_trend_score(trend_info, FUTURES_LONG)
+    short_trend = _directional_trend_score(trend_info, FUTURES_SHORT)
+    long_deep = _directional_deep_score(deep_context, FUTURES_LONG)
+    short_deep = _directional_deep_score(deep_context, FUTURES_SHORT)
+
+    rsi = _safe_float(indicators.rsi, 50.0)
+    ma20 = _safe_float(indicators.ma20, snapshot.current_price)
+    ma50 = _safe_float(indicators.ma50, snapshot.current_price)
+    volume_ratio = _safe_float(indicators.volume_ratio, 1.0)
+    momentum = _safe_float(indicators.momentum, 0.0)
+    liquidity_score = _safe_float(deep_context.get("liquidity_score"), 0.0)
+    risk_score = _safe_float(deep_context.get("risk_score"), 50.0)
+    long_extension = _safe_float(deep_context.get("long_extension_penalty", deep_context.get("extension_penalty")), 0.0)
+    short_extension = _safe_float(deep_context.get("short_extension_penalty", deep_context.get("extension_penalty")), 0.0)
+
+    futures_long = _safe_float((futures_context or {}).get("matrix_score_long", (futures_context or {}).get("futures_score")), 0.0)
+    futures_short = _safe_float((futures_context or {}).get("matrix_score_short", (futures_context or {}).get("futures_score")), 0.0)
+    spread_abs = abs(_safe_float((futures_context or {}).get("spread"), 0.0))
+    basis = _safe_float((futures_context or {}).get("basis"), 0.0)
+    funding_rate = _safe_float((futures_context or {}).get("funding_rate"), 0.0)
+    open_interest = _safe_float((futures_context or {}).get("open_interest"), 0.0)
+    futures_volume = _safe_float((futures_context or {}).get("futures_volume_24h"), 0.0)
+    range_position = _range_position(snapshot)
+    regime_label = regime.get("label", "UNKNOWN")
+
+    long_score = 12.0
+    short_score = 12.0
+
+    long_score += long_pump * 0.12
+    short_score += short_pump * 0.12
+    long_score += long_deep * 0.18
+    short_score += short_deep * 0.18
+    long_score += min(long_trend, 100.0) * 0.14
+    short_score += min(short_trend, 100.0) * 0.14
+    long_score += min(futures_long, 100.0) * 0.20
+    short_score += min(futures_short, 100.0) * 0.20
+    long_score += _clamp((volume_ratio - 1.0) / 4.0, 0.0, 1.0) * 8.0
+    short_score += _clamp((volume_ratio - 1.0) / 4.0, 0.0, 1.0) * 8.0
+    long_score += _clamp(momentum / 12.0, 0.0, 1.0) * 8.0
+    short_score += _clamp(abs(min(momentum, 0.0)) / 12.0, 0.0, 1.0) * 8.0
+    long_score += _clamp(liquidity_score / 100.0, 0.0, 1.0) * 6.0
+    short_score += _clamp(liquidity_score / 100.0, 0.0, 1.0) * 6.0
+
+    if snapshot.current_price >= ma20 >= ma50:
+        long_score += 6
+    if snapshot.current_price <= ma20 <= ma50:
+        short_score += 6
+
+    if 46 <= rsi <= 67:
+        long_score += 7
+    elif rsi > 78:
+        long_score -= 10
+    elif rsi > 72:
+        long_score -= 5
+    elif rsi < 28:
+        long_score -= 6
+
+    if 34 <= rsi <= 57:
+        short_score += 7
+    elif rsi < 22:
+        short_score -= 10
+    elif rsi < 28:
+        short_score -= 5
+    elif rsi > 74:
+        short_score -= 6
+
+    if range_position >= 0.72:
+        long_score += 4
+    elif range_position <= 0.28:
+        short_score += 4
+
+    if regime_label == "RISK_ON":
+        long_score += 5
+        short_score -= 5
+    elif regime_label in {"PANIC", "RISK_OFF"}:
+        long_score -= 6
+        short_score += 5
+    elif regime_label == "RANGE":
+        long_score -= 2
+        short_score -= 2
+
+    if spread_abs <= 0.30 and spread_abs > 0:
+        long_score += 4
+        short_score += 4
+    elif spread_abs >= 1.20:
+        long_score -= 5
+        short_score -= 5
+
+    if abs(basis) <= 0.35:
+        long_score += 3
+        short_score += 3
+    elif basis >= 0.65:
+        long_score -= 3
+    elif basis <= -0.65:
+        short_score -= 3
+
+    if funding_rate >= 0.05:
+        long_score -= 4
+        short_score += 2
+    elif funding_rate <= -0.05:
+        short_score -= 4
+        long_score += 2
+
+    if open_interest >= 10_000_000:
+        long_score += 2
+        short_score += 2
+    if futures_volume >= 20_000_000:
+        long_score += 2
+        short_score += 2
+
+    long_score -= _clamp(long_extension, 0.0, 12.0) * 0.7
+    short_score -= _clamp(short_extension, 0.0, 12.0) * 0.7
+    long_score -= _clamp((risk_score - 35.0) / 35.0, 0.0, 1.0) * 10.0
+    short_score -= _clamp((risk_score - 35.0) / 35.0, 0.0, 1.0) * 10.0
+
+    live_action_upper = str(live_action or "").upper()
+    if live_action_upper == "BUY":
+        long_score += min(live_confidence, 100.0) * 0.05
+    elif live_action_upper == "SHORT":
+        short_score += min(live_confidence, 100.0) * 0.05
+    long_score += live_final_score * 0.03
+    short_score += live_final_score * 0.03
+
+    long_score = round(_clamp(long_score, 0.0, 100.0), 2)
+    short_score = round(_clamp(short_score, 0.0, 100.0), 2)
+
+    if long_score >= 72.0 and long_score >= short_score + 6.0:
+        shadow_action = "BUY"
+        shadow_bias = FUTURES_LONG
+        selected_score = long_score
+    elif short_score >= 72.0 and short_score >= long_score + 6.0:
+        shadow_action = "SHORT"
+        shadow_bias = FUTURES_SHORT
+        selected_score = short_score
+    elif max(long_score, short_score) >= 55.0:
+        shadow_action = "HOLD"
+        shadow_bias = FUTURES_LONG if long_score >= short_score else FUTURES_SHORT
+        selected_score = max(long_score, short_score)
+    else:
+        shadow_action = "AVOID"
+        shadow_bias = FUTURES_WAIT
+        selected_score = max(long_score, short_score)
+
+    margin = abs(long_score - short_score)
+    shadow_confidence = _clamp(selected_score * 0.72 + margin * 0.28, 5.0, 99.0)
+
+    notes: List[str] = []
+    if shadow_bias == FUTURES_LONG:
+        if futures_long >= 75:
+            notes.append("long futures matrix is strong")
+        if long_trend >= 45:
+            notes.append("bullish trend persistence is improving")
+        if 46 <= rsi <= 67:
+            notes.append("RSI remains supportive for continuation")
+    elif shadow_bias == FUTURES_SHORT:
+        if futures_short >= 75:
+            notes.append("short futures matrix is strong")
+        if short_trend >= 45:
+            notes.append("bearish trend persistence is improving")
+        if 34 <= rsi <= 57:
+            notes.append("RSI still leaves room for downside")
+    else:
+        notes.append("long and short cases are too close")
+
+    if spread_abs >= 1.20:
+        notes.append("execution spread is wide")
+    if risk_score >= 70:
+        notes.append("risk proxy remains elevated")
+
+    return {
+        "shadow_action": shadow_action,
+        "shadow_bias": shadow_bias,
+        "shadow_confidence": round(shadow_confidence, 1),
+        "shadow_score": round(selected_score, 2),
+        "shadow_score_long": long_score,
+        "shadow_score_short": short_score,
+        "shadow_note": "; ".join(notes[:3]),
+    }
 
 
 def summarize_futures_context(

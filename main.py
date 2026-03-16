@@ -54,6 +54,7 @@ from learning_engine import (
 )
 from market_intelligence import (
     analyse_deep_context,
+    calculate_shadow_trade_eval,
     calculate_final_publish_score,
     classify_market_regime,
     score_watchlist_candidate,
@@ -120,6 +121,7 @@ def build_signal(
     futures_context,
     regime,
     trend_score,
+    shadow_eval,
 ) -> TradingSignal:
     entry = snap.current_price
     direction = _direction_from_action(ai_action, futures_context.get("trade_bias", "LONG"))
@@ -184,6 +186,11 @@ def build_signal(
         spread=futures_context.get("spread", 0.0),
         futures_volume_24h=futures_context.get("futures_volume_24h", 0.0),
         futures_score=futures_context.get("futures_score", 0.0),
+        shadow_action=shadow_eval.get("shadow_action", "HOLD"),
+        shadow_bias=shadow_eval.get("shadow_bias", "WAIT"),
+        shadow_confidence=shadow_eval.get("shadow_confidence", 0.0),
+        shadow_score=shadow_eval.get("shadow_score", 0.0),
+        shadow_note=shadow_eval.get("shadow_note", ""),
     )
 
 
@@ -568,6 +575,18 @@ def run_cycle(
             market_regime,
             futures_context,
         )
+        shadow_eval = calculate_shadow_trade_eval(
+            snap,
+            ind,
+            pump,
+            trend_info,
+            deep_context,
+            market_regime,
+            futures_context,
+            action,
+            confidence,
+            final_score,
+        )
 
         if not should_emit_signal(
             snap,
@@ -599,6 +618,7 @@ def run_cycle(
                 trend_info,
                 _direction_from_action(action, getattr(pump, "direction", "LONG")),
             ),
+            shadow_eval,
         )
         candidate_signals.append(signal)
 

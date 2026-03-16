@@ -310,6 +310,7 @@ HTML = """
 
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="latest">Latest</button>
+    <button class="tab-btn" data-tab="shadow">Shadow Lab</button>
     <button class="tab-btn" data-tab="simulation">Simulation</button>
     <button class="tab-btn" data-tab="history">History</button>
     <button class="tab-btn" data-tab="futures">Futures Layer</button>
@@ -334,6 +335,7 @@ HTML = """
         <span>P&amp;L: {{ fmt_inr(best_signal.simulation_pnl_inr, show_sign=True) }}</span>
         <span>Confidence: {{ best_signal.confidence | int }}%</span>
         <span>Final: {{ (best_signal.aggregate_score or best_signal.quality_score or best_signal.pump_score) | int }}/100</span>
+        <span>Shadow: {{ best_signal.shadow_action or "HOLD" }} {{ (best_signal.shadow_score or 0) | int }}/100</span>
         <span>Regime: {{ best_signal.market_regime or "UNKNOWN" }}</span>
         <span>Setup: {{ best_signal.futures_bias or "UNAVAILABLE" }}</span>
         <span>Suggested Lev: {{ best_signal.leverage_hint or "Unavailable" }}</span>
@@ -394,6 +396,72 @@ HTML = """
     </div>
     {% else %}
     <p class="note">No live signals yet. The agent is still scanning the market.</p>
+    {% endif %}
+  </div>
+
+  <div id="tab-shadow" class="tab-panel">
+    <div class="section-title">Shadow Model</div>
+    <p class="note">
+      This experimental model runs in the background only. It does not change live publishing.
+      It stores a richer directional score beside each live signal so we can compare outcomes after enough history builds up.
+    </p>
+    <div class="mini-grid">
+      <div class="mini-card">
+        <div class="k">Tracked Signals</div>
+        <div class="v">{{ shadow_summary.tracked }}</div>
+      </div>
+      <div class="mini-card">
+        <div class="k">Agreement Rate</div>
+        <div class="v">{{ fmt_pct(shadow_summary.agreement_rate, 2) }}</div>
+      </div>
+      <div class="mini-card">
+      <div class="k">Avg Live Final</div>
+      <div class="v">{{ shadow_summary.avg_live_final | int }}/100</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Avg Shadow Score</div>
+      <div class="v">{{ shadow_summary.avg_shadow_score | int }}/100</div>
+    </div>
+  </div>
+    {% if history_signals %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Coin</th>
+            <th>Live Action</th>
+            <th>Live Final</th>
+            <th>Live Conf</th>
+            <th>Shadow Action</th>
+            <th>Shadow Bias</th>
+            <th>Shadow Score</th>
+            <th>Shadow Conf</th>
+            <th>Alignment</th>
+            <th>Shadow Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in history_signals %}
+          <tr>
+            <td style="color:#8b949e">{{ fmt_timestamp(s.timestamp) }}</td>
+            <td><strong>{{ s.symbol }}</strong><br><small style="color:#8b949e">{{ s.coin }}</small></td>
+            <td><span class="badge badge-{{ s.ai_action | lower }}">{{ s.ai_action }}</span></td>
+            <td>{{ (s.aggregate_score or 0) | int }}/100</td>
+            <td>{{ s.confidence | int }}%</td>
+            <td><span class="badge badge-{{ s.shadow_action | lower }}">{{ s.shadow_action or "HOLD" }}</span></td>
+            <td>{{ s.shadow_bias or "WAIT" }}</td>
+            <td>{{ (s.shadow_score or 0) | int }}/100</td>
+            <td>{{ (s.shadow_confidence or 0) | int }}%</td>
+            <td>{{ shadow_alignment(s) }}</td>
+            <td>{{ s.shadow_note or "-" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="note">No saved signals yet, so the shadow model has nothing to compare.</p>
     {% endif %}
   </div>
 
@@ -686,6 +754,11 @@ def _normalise_signal(signal: dict) -> dict:
     merged.setdefault("quality_score", merged.get("pump_score", 0.0))
     merged.setdefault("aggregate_score", merged.get("quality_score", merged.get("pump_score", 0.0)))
     merged.setdefault("market_regime", "UNKNOWN")
+    merged.setdefault("shadow_action", "HOLD")
+    merged.setdefault("shadow_bias", "WAIT")
+    merged.setdefault("shadow_confidence", 0.0)
+    merged.setdefault("shadow_score", 0.0)
+    merged.setdefault("shadow_note", "")
     return merged
 
 
@@ -693,6 +766,45 @@ def _is_live_trade_signal(signal: dict) -> bool:
     action = str(signal.get("ai_action") or "").upper()
     bias = str(signal.get("futures_bias") or "").upper()
     return (action == "BUY" and bias == "LONG") or (action == "SHORT" and bias == "SHORT")
+
+
+def _shadow_alignment(signal: dict) -> str:
+    live_action = str(signal.get("ai_action") or "").upper()
+    shadow_action = str(signal.get("shadow_action") or "").upper()
+    if shadow_action == live_action:
+        return "MATCH"
+    if shadow_action in {"BUY", "SHORT"} and live_action in {"BUY", "SHORT"}:
+        return "DIVERGED"
+    return "NEUTRAL"
+
+
+def _build_shadow_summary(signals) -> dict:
+    if not signals:
+        return {
+            "tracked": 0,
+            "agreement_rate": 0.0,
+            "avg_live_final": 0.0,
+            "avg_shadow_score": 0.0,
+        }
+
+    directional = [
+        signal for signal in signals
+        if str(signal.get("ai_action") or "").upper() in {"BUY", "SHORT"}
+    ]
+    matches = sum(1 for signal in directional if _shadow_alignment(signal) == "MATCH")
+    agreement_rate = (matches / len(directional) * 100.0) if directional else 0.0
+    avg_live_final = (
+        sum(float(signal.get("aggregate_score") or 0.0) for signal in signals) / len(signals)
+    )
+    avg_shadow_score = (
+        sum(float(signal.get("shadow_score") or 0.0) for signal in signals) / len(signals)
+    )
+    return {
+        "tracked": len(signals),
+        "agreement_rate": round(agreement_rate, 2),
+        "avg_live_final": round(avg_live_final, 2),
+        "avg_shadow_score": round(avg_shadow_score, 2),
+    }
 
 
 @app.route("/")
@@ -708,6 +820,7 @@ def index():
     ]
     stats = get_stats()
     simulation = get_simulation_stats()
+    shadow_summary = _build_shadow_summary(history_signals)
     weights = load_weights()
     best_signal = _pick_best_signal(latest_signals)
     storage_backend = get_storage_backend_name()
@@ -718,6 +831,7 @@ def index():
         history_signals=history_signals,
         stats=stats,
         simulation=simulation,
+        shadow_summary=shadow_summary,
         weights=weights,
         best_signal=best_signal,
         storage_backend=storage_backend,
@@ -727,6 +841,7 @@ def index():
         fmt_pct=_format_pct,
         fmt_age=_format_age,
         fmt_timestamp=_format_timestamp,
+        shadow_alignment=_shadow_alignment,
         now=now,
     )
 

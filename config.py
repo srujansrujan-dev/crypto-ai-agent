@@ -63,7 +63,7 @@ SIGNAL_MAX_AGE_HOURS  = 48
 SIGNAL_DEDUP_HOURS    = 12
 LEARNING_MIN_CLOSED_SIGNALS = 12
 LEARNING_LOOKBACK_SIGNALS   = 200
-SIMULATION_STAKE_INR = float(os.getenv("SIMULATION_STAKE_INR", "100"))
+SIMULATION_STAKE_INR = 100.0
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 DB_PATH      = "data/signals.db"

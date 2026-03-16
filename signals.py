@@ -93,6 +93,11 @@ class TradingSignal:
     spread:          float = 0.0
     futures_volume_24h: float = 0.0
     futures_score:   float = 0.0
+    shadow_action:   str = "HOLD"
+    shadow_bias:     str = "WAIT"
+    shadow_confidence: float = 0.0
+    shadow_score:    float = 0.0
+    shadow_note:     str = ""
     outcome:         str = "PENDING"   # PENDING / WIN / LOSS / NEUTRAL
     outcome_price:   Optional[float] = None
     outcome_checked: bool = False

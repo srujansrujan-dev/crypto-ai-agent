@@ -77,6 +77,11 @@ _SIGNAL_COLUMN_TYPES = {
     "spread": "REAL DEFAULT 0",
     "futures_volume_24h": "REAL DEFAULT 0",
     "futures_score": "REAL DEFAULT 0",
+    "shadow_action": "TEXT DEFAULT 'HOLD'",
+    "shadow_bias": "TEXT DEFAULT 'WAIT'",
+    "shadow_confidence": "REAL DEFAULT 0",
+    "shadow_score": "REAL DEFAULT 0",
+    "shadow_note": "TEXT DEFAULT ''",
     "outcome": "TEXT DEFAULT 'PENDING'",
     "outcome_price": "REAL",
     "outcome_checked": "INTEGER DEFAULT 0",
@@ -183,6 +188,11 @@ def _ensure_sqlite_schema(conn) -> None:
             spread           REAL    DEFAULT 0,
             futures_volume_24h REAL  DEFAULT 0,
             futures_score    REAL    DEFAULT 0,
+            shadow_action    TEXT    DEFAULT 'HOLD',
+            shadow_bias      TEXT    DEFAULT 'WAIT',
+            shadow_confidence REAL   DEFAULT 0,
+            shadow_score     REAL    DEFAULT 0,
+            shadow_note      TEXT    DEFAULT '',
             outcome          TEXT    DEFAULT 'PENDING',
             outcome_price    REAL,
             outcome_checked  INTEGER DEFAULT 0,
@@ -251,6 +261,11 @@ def _ensure_postgres_schema(conn) -> None:
             spread           DOUBLE PRECISION DEFAULT 0,
             futures_volume_24h DOUBLE PRECISION DEFAULT 0,
             futures_score    DOUBLE PRECISION DEFAULT 0,
+            shadow_action    TEXT DEFAULT 'HOLD',
+            shadow_bias      TEXT DEFAULT 'WAIT',
+            shadow_confidence DOUBLE PRECISION DEFAULT 0,
+            shadow_score     DOUBLE PRECISION DEFAULT 0,
+            shadow_note      TEXT DEFAULT '',
             outcome          TEXT DEFAULT 'PENDING',
             outcome_price    DOUBLE PRECISION,
             outcome_checked  BOOLEAN DEFAULT FALSE,
@@ -336,6 +351,11 @@ def _signal_payload(signal: TradingSignal):
         signal.spread,
         signal.futures_volume_24h,
         signal.futures_score,
+        signal.shadow_action,
+        signal.shadow_bias,
+        signal.shadow_confidence,
+        signal.shadow_score,
+        signal.shadow_note,
         signal.outcome,
         signal.outcome_price,
         bool(signal.outcome_checked),
@@ -354,7 +374,7 @@ def save_signal(signal: TradingSignal) -> int:
             "liquidity_score, risk_score, market_regime, regime_score, trend_score, volume_ratio, "
             "momentum, rsi, market_cap, price_change_24h, futures_bias, leverage_hint, "
             "futures_exchange, futures_symbol, funding_rate, open_interest, basis, spread, "
-            "futures_volume_24h, futures_score, outcome, "
+            "futures_volume_24h, futures_score, shadow_action, shadow_bias, shadow_confidence, shadow_score, shadow_note, outcome, "
             "outcome_price, outcome_checked"
         )
         payload = _signal_payload(signal)
