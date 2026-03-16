@@ -33,7 +33,7 @@ def format_signal(signal: TradingSignal) -> str:
     futures_line = ""
     if signal.futures_bias != "NO-DATA" or signal.futures_score > 0:
         futures_line = (
-            f"  Futures     : {signal.futures_bias}  |  Lev {signal.leverage_hint}  |  "
+            f"  CoinDCX Fut : {signal.futures_bias}  |  Lev {signal.leverage_hint}  |  "
             f"Funding {signal.funding_rate:.4f}  |  OI ${signal.open_interest:,.0f}\n"
         )
 
@@ -86,8 +86,9 @@ def send_startup_banner() -> None:
   DISCLAIMER: This tool provides analysis ONLY.
       It does NOT execute trades. Use at your own risk.
 {'-' * 60}
-  Data source : CoinGecko (free tier)
-  AI engine   : Gemini 1.5 Flash
+  Data source : CoinGecko + CoinDCX public APIs
+  Universe    : CoinDCX-listed assets, filtered to CoinDCX futures when enabled
+  AI engine   : Gemini
   Scan every  : 5 minutes
   Dashboard   : http://localhost:8080
 {'-' * 60}

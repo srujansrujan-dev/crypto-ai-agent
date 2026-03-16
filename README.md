@@ -1,8 +1,9 @@
 # 🤖 Crypto AI Agent
 
-A cryptocurrency market analysis agent that continuously scans 500+ coins,
-detects pump opportunities, evaluates them with Gemini AI, and displays
-trading suggestions on a live web dashboard.
+A cryptocurrency market analysis agent that continuously scans the wider
+market, filters results down to CoinDCX-listed tradable symbols, prioritises
+CoinDCX futures instruments, evaluates opportunities with Gemini AI, and
+displays trading suggestions on a live web dashboard.
 
 > ⚠️ **DISCLAIMER:** This tool provides analysis ONLY. It does NOT execute
 > trades and does NOT connect to any exchange account. Use at your own risk.
@@ -13,12 +14,13 @@ trading suggestions on a live web dashboard.
 
 | Feature | Detail |
 |---|---|
-| Market scanner | 500+ coins via CoinGecko free API |
+| Market scanner | 500+ coins via CoinGecko, filtered to CoinDCX tradable universe |
 | Indicators | RSI, MA20, MA50, Momentum, Volatility, Volume Ratio |
 | Pump detector | Scoring system (0–100), flags ≥70 |
 | Trend detector | Multi-cycle volume & momentum tracking |
 | AI analysis | Gemini 1.5 Flash → BUY / HOLD / AVOID |
 | Self-learning | Tracks WIN/LOSS, adjusts weights automatically |
+| Futures layer | CoinDCX active futures instruments + conservative leverage hint |
 | Dashboard | Live web UI at port 8080 |
 | Backtester | Historical signal testing with win rate & drawdown |
 
@@ -72,9 +74,9 @@ python backtester.py --coins bitcoin,ethereum,solana,cardano --days 60
 
 ---
 
-## ☁️ Deploy to Render (Free Cloud — Recommended)
+## ☁️ Deploy to Render (Free Cloud)
 
-Render keeps your agent running 24/7 for free.
+Render can host the dashboard, but free web services sleep after inactivity, so it is better for demos than for a strict 24/7 futures scanner.
 
 ### Steps:
 
@@ -168,6 +170,8 @@ These adjust automatically over time based on real performance.
 |---|---|---|
 | `GEMINI_API_KEY` | ✅ Yes | Free from aistudio.google.com |
 | `COINGECKO_API_KEY` | ❌ No | Leave blank (free tier works) |
+| `COINDCX_PREFERRED_MARGIN_ASSET` | ❌ No | Preferred CoinDCX futures margin asset, default `USDT` |
+| `COINDCX_RECOMMENDED_LEVERAGE_CAP` | ❌ No | Hard cap for suggested leverage, default `3` |
 | `PORT` | ❌ No | Set automatically by Render/Railway |
 
 ---

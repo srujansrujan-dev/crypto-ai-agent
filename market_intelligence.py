@@ -15,6 +15,8 @@ bad conclusions.
 from statistics import median
 from typing import Dict, List, Optional
 
+from config import COINDCX_RECOMMENDED_LEVERAGE_CAP
+from scanner import fetch_coindcx_futures_prices, fetch_coindcx_instrument_details
 from signals import IndicatorSet, MarketSnapshot, PumpScore
 
 MAJOR_SYMBOLS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
@@ -315,118 +317,131 @@ def summarize_futures_context(
     derivatives: Optional[List[dict]],
 ) -> dict:
     """
-    Summarise live derivatives context for a spot symbol.
+    Summarise CoinDCX futures context for a spot symbol.
 
-    This is a real futures-data layer driven by CoinGecko's derivatives feed.
-    It does not force a decision when futures coverage is missing; instead it
-    returns a neutral NO-DATA state so the rest of the system can degrade
-    gracefully.
+    The goal is to keep final suggestions tied to instruments the user can
+    actually trade on CoinDCX futures, including a conservative leverage hint
+    that never exceeds CoinDCX's published max leverage for that instrument.
     """
     rows = derivatives or []
-    if not rows:
+    if not rows or not snapshot.coindcx_has_futures:
         return {
             "has_data": False,
             "trade_bias": "NO-DATA",
             "leverage_hint": "1x",
-            "futures_exchange": "",
-            "futures_symbol": "",
+            "futures_exchange": "CoinDCX",
+            "futures_symbol": snapshot.coindcx_futures_instrument or "",
             "funding_rate": 0.0,
             "open_interest": 0.0,
             "basis": 0.0,
             "spread": 0.0,
             "futures_volume_24h": 0.0,
             "futures_score": 0.0,
-            "notes": ["no derivatives coverage found"],
+            "notes": ["no active CoinDCX futures instrument found for this symbol"],
         }
 
     symbol_key = _normalise_symbol(snapshot.symbol)
-    matches = []
-    for row in rows:
-        if row.get("expired_at"):
-            continue
-        index_id = _normalise_symbol(row.get("index_id", ""))
-        derivative_symbol = _normalise_symbol(row.get("symbol", ""))
-        if index_id == symbol_key or derivative_symbol.startswith(symbol_key):
-            matches.append(row)
+    matches = [row for row in rows if _normalise_symbol(row.get("underlying_symbol", "")) == symbol_key]
+    if not matches and snapshot.coindcx_futures_instrument:
+        matches = [
+            row
+            for row in rows
+            if str(row.get("instrument_name") or "") == snapshot.coindcx_futures_instrument
+        ]
 
     if not matches:
         return {
             "has_data": False,
             "trade_bias": "NO-DATA",
             "leverage_hint": "1x",
-            "futures_exchange": "",
-            "futures_symbol": "",
+            "futures_exchange": "CoinDCX",
+            "futures_symbol": snapshot.coindcx_futures_instrument or "",
             "funding_rate": 0.0,
             "open_interest": 0.0,
             "basis": 0.0,
             "spread": 0.0,
             "futures_volume_24h": 0.0,
             "futures_score": 0.0,
-            "notes": ["no active derivatives market found for this symbol"],
+            "notes": ["CoinDCX futures universe does not include this symbol"],
         }
 
-    perpetuals = [
-        row
-        for row in matches
-        if "perpetual" in str(row.get("contract_type", "")).lower()
-    ]
-    if perpetuals:
-        matches = perpetuals
+    preferred = None
+    if snapshot.coindcx_futures_instrument:
+        preferred = next(
+            (
+                row for row in matches
+                if str(row.get("instrument_name") or "") == snapshot.coindcx_futures_instrument
+            ),
+            None,
+        )
+    lead = preferred or matches[0]
+    instrument_name = str(lead.get("instrument_name") or snapshot.coindcx_futures_instrument or "")
+    details = fetch_coindcx_instrument_details(instrument_name) if instrument_name else {}
+    live_prices = fetch_coindcx_futures_prices([instrument_name]) if instrument_name else {}
+    price_row = live_prices.get(instrument_name, {})
 
-    matches.sort(key=lambda row: _safe_float(row.get("volume_24h")), reverse=True)
-    top = matches[:5]
+    futures_price = _safe_float(
+        price_row.get("last_price")
+        or details.get("last_price")
+        or snapshot.current_price
+    )
+    basis = (
+        ((futures_price - snapshot.current_price) / snapshot.current_price) * 100.0
+        if snapshot.current_price
+        else 0.0
+    )
+    spread = _safe_float(price_row.get("spread") or details.get("spread"))
+    funding_rate = _safe_float(price_row.get("funding_rate") or details.get("funding_rate"))
+    open_interest = _safe_float(price_row.get("open_interest") or details.get("open_interest"))
+    futures_volume_24h = _safe_float(price_row.get("volume_24h"))
+    max_long = _safe_float(details.get("max_leverage_long") or snapshot.coindcx_max_leverage_long or 1.0, 1.0)
+    max_short = _safe_float(details.get("max_leverage_short") or snapshot.coindcx_max_leverage_short or max_long, max_long)
 
-    futures_volume_24h = sum(max(_safe_float(row.get("volume_24h")), 0.0) for row in top)
-    open_interest = sum(max(_safe_float(row.get("open_interest")), 0.0) for row in top)
-    funding_rate = _weighted_average(top, "funding_rate", "volume_24h")
-    basis = _weighted_average(top, "basis", "volume_24h")
-    spread = _weighted_average(top, "spread", "volume_24h")
-    futures_price_change = _weighted_average(top, "price_change_24h", "volume_24h")
-
-    score = 44.0
+    score = 48.0
     notes: List[str] = []
 
-    if futures_volume_24h >= 500_000_000:
-        score += 18
-        notes.append("strong derivatives volume")
-    elif futures_volume_24h >= 100_000_000:
-        score += 12
-        notes.append("healthy derivatives volume")
-    elif futures_volume_24h >= 20_000_000:
-        score += 6
-        notes.append("moderate derivatives volume")
-
-    if open_interest >= 250_000_000:
-        score += 12
-        notes.append("deep open interest")
-    elif open_interest >= 50_000_000:
-        score += 7
-    elif open_interest <= 1_000_000:
-        score -= 6
-        notes.append("open interest is thin")
-
-    spread_abs = abs(spread)
-    if spread_abs <= 0.20:
+    if max_long >= 20:
         score += 8
-    elif spread_abs <= 0.50:
-        score += 4
-    elif spread_abs >= 1.50:
-        score -= 8
-        notes.append("spread is wide")
-
-    if basis >= 0 and snapshot.price_change_24h > 0:
+    elif max_long >= 10:
         score += 5
-        notes.append("basis supports bullish continuation")
-    elif basis < 0 and snapshot.price_change_24h > 0:
-        score -= 6
-        notes.append("basis is weak versus spot strength")
-    elif basis < 0 and snapshot.price_change_24h < 0:
+    elif max_long >= 5:
         score += 3
 
-    if -0.02 <= funding_rate <= 0.02:
-        score += 6
-    elif abs(funding_rate) >= 0.10:
+    spread_abs = abs(spread)
+    if spread_abs == 0:
+        notes.append("live bid/ask spread not published by CoinDCX for this instrument")
+    elif spread_abs <= 0.25:
+        score += 8
+    elif spread_abs <= 0.75:
+        score += 4
+    else:
         score -= 8
+        notes.append("futures spread is wide")
+
+    basis_abs = abs(basis)
+    if basis_abs <= 0.35:
+        score += 10
+        notes.append("futures price is tracking spot closely")
+    elif basis_abs <= 1.0:
+        score += 4
+    else:
+        score -= 6
+        notes.append("futures basis is stretched versus spot")
+
+    if futures_volume_24h >= 100_000_000:
+        score += 8
+    elif futures_volume_24h >= 20_000_000:
+        score += 4
+
+    if open_interest >= 100_000_000:
+        score += 8
+    elif open_interest >= 10_000_000:
+        score += 4
+
+    if -0.02 <= funding_rate <= 0.02 and funding_rate != 0:
+        score += 4
+    elif abs(funding_rate) >= 0.10:
+        score -= 6
         notes.append("funding looks crowded")
 
     regime_label = regime.get("label", "UNKNOWN")
@@ -435,27 +450,29 @@ def summarize_futures_context(
     elif regime_label in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
         score -= 6
 
-    if snapshot.price_change_24h > 0 and futures_price_change >= 0 and basis >= -0.10 and funding_rate > -0.03:
+    if snapshot.price_change_24h > 0 and basis >= -0.40 and regime_label not in {"PANIC", "RISK_OFF"}:
         trade_bias = "LONG"
-    elif snapshot.price_change_24h < 0 and futures_price_change <= 0 and basis <= 0 and funding_rate < 0:
+    elif snapshot.price_change_24h < 0 and basis <= 0 and regime_label in {"PANIC", "RISK_OFF", "RANGE"}:
         trade_bias = "SHORT"
     else:
         trade_bias = "NO-TRADE"
 
-    if trade_bias == "LONG" and score >= 78 and spread_abs <= 0.30:
-        leverage_hint = "3x"
-    elif trade_bias == "LONG" and score >= 62:
-        leverage_hint = "2x"
+    recommended_cap = max(1.0, min(max_long, COINDCX_RECOMMENDED_LEVERAGE_CAP))
+    if trade_bias == "LONG" and score >= 82 and spread_abs <= 0.30 and basis_abs <= 0.35 and snapshot.market_cap >= 1_000_000_000:
+        leverage_hint = f"{int(min(3.0, recommended_cap))}x / max {int(max_long)}x"
+    elif trade_bias == "LONG" and score >= 68:
+        leverage_hint = f"{int(min(2.0, recommended_cap))}x / max {int(max_long)}x"
+    elif trade_bias == "SHORT" and score >= 72:
+        leverage_hint = f"1x / max {int(max_short)}x short"
     else:
-        leverage_hint = "1x"
+        leverage_hint = f"1x / max {int(max_long)}x"
 
-    lead = top[0]
     return {
         "has_data": True,
         "trade_bias": trade_bias,
         "leverage_hint": leverage_hint,
-        "futures_exchange": str(lead.get("market") or ""),
-        "futures_symbol": str(lead.get("symbol") or snapshot.symbol),
+        "futures_exchange": "CoinDCX",
+        "futures_symbol": instrument_name or snapshot.symbol,
         "funding_rate": round(funding_rate, 6),
         "open_interest": round(open_interest, 2),
         "basis": round(basis, 4),

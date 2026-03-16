@@ -65,6 +65,7 @@ def _build_prompt(
     indicators: IndicatorSet,
     pump:       PumpScore,
     trend_info: Optional[dict] = None,
+    futures_context: Optional[dict] = None,
 ) -> str:
     trend_block = ""
     if trend_info:
@@ -74,6 +75,20 @@ Trend Detection (last 6 cycles):
   Price acceleration : {trend_info.get('price_accel', 0):.2f}%
   Momentum delta     : {trend_info.get('momentum_delta', 0):.2f}%
   Composite trend    : {trend_info.get('trend_score', 0):.1f}/100
+"""
+
+    futures_block = ""
+    if futures_context and futures_context.get("has_data"):
+        futures_block = f"""
+=== COINDCX FUTURES CONTEXT ===
+Instrument    : {futures_context.get('futures_symbol', snapshot.symbol)}
+Exchange      : {futures_context.get('futures_exchange', 'CoinDCX')}
+Trade Bias    : {futures_context.get('trade_bias', 'NO-DATA')}
+Leverage Hint : {futures_context.get('leverage_hint', '1x')}
+Funding Rate  : {futures_context.get('funding_rate', 0.0):.6f}
+Open Interest : {futures_context.get('open_interest', 0.0):,.0f}
+Basis vs Spot : {futures_context.get('basis', 0.0):+.2f}%
+Futures Score : {futures_context.get('futures_score', 0.0):.1f}/100
 """
 
     return f"""
@@ -105,6 +120,7 @@ Total Score  : {pump.total_score:.1f} / 100
   Momentum breakout  : {pump.momentum_breakout}
   Small cap bonus    : {pump.small_cap}
 {trend_block}
+{futures_block}
 
 === YOUR TASK ===
 Analyse this opportunity as a professional trader would. Consider:
@@ -255,6 +271,7 @@ def analyse(
     indicators: IndicatorSet,
     pump:       PumpScore,
     trend_info: Optional[dict] = None,
+    futures_context: Optional[dict] = None,
     retries:    int = 2,
 ) -> Tuple[str, float, str]:
     """
@@ -271,7 +288,7 @@ def analyse(
         logger.warning("No Gemini model — using fallback heuristics for %s.", snapshot.symbol)
         return _smart_fallback_analysis(snapshot, indicators, pump, trend_info)
 
-    prompt = _build_prompt(snapshot, indicators, pump, trend_info)
+    prompt = _build_prompt(snapshot, indicators, pump, trend_info, futures_context)
 
     for attempt in range(1, retries + 1):
         try:

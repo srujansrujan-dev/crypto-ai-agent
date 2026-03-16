@@ -21,6 +21,7 @@ from ai_engine import analyse
 from alerts import send_cycle_summary, send_signal, send_startup_banner
 from config import (
     ALLOWED_SIGNAL_ACTIONS,
+    COINDCX_FUTURES_ONLY,
     DEFAULT_STOP_LOSS_PCT,
     DEFAULT_TARGET_PCT,
     LOG_FILE,
@@ -101,8 +102,8 @@ def build_signal(
         context_suffix += f" Note: {risk_notes[0]}."
     if futures_context.get("has_data"):
         context_suffix += (
-            f" Futures: {futures_context.get('trade_bias', 'NO-DATA')} bias, "
-            f"{futures_context.get('leverage_hint', '1x')} leverage hint, "
+            f" CoinDCX futures: {futures_context.get('trade_bias', 'NO-DATA')} bias, "
+            f"recommended {futures_context.get('leverage_hint', '1x')} leverage, "
             f"funding {futures_context.get('funding_rate', 0.0):.4f}, "
             f"OI {futures_context.get('open_interest', 0.0):,.0f}."
         )
@@ -377,6 +378,8 @@ def run_cycle(
 
     rough_candidates = []
     for snap, ind, pump in opportunities:
+        if COINDCX_FUTURES_ONLY and not snap.coindcx_has_futures:
+            continue
         trend_info = trends.evaluate(snap.id)
         rough_candidates.append(
             {
@@ -387,6 +390,8 @@ def run_cycle(
                 "trend_info": trend_info,
             }
         )
+    if COINDCX_FUTURES_ONLY:
+        logger.info("CoinDCX futures-eligible opportunities: %d", len(rough_candidates))
     rough_candidates.sort(key=lambda item: item["rough_score"], reverse=True)
 
     watchlist = []
@@ -433,7 +438,7 @@ def run_cycle(
             logger.info("Skipping %s â€” recent pending signal already exists", snap.symbol)
             continue
 
-        action, confidence, reason = analyse(snap, ind, pump, trend_info)
+        action, confidence, reason = analyse(snap, ind, pump, trend_info, futures_context)
         quality_score = calculate_signal_quality(
             snap, ind, pump, action, confidence, trend_info,
         )

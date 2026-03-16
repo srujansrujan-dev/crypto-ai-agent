@@ -19,6 +19,12 @@ class MarketSnapshot:
     price_change_7d:     float = 0.0   # percentage (may be missing)
     high_24h:            float = 0.0
     low_24h:             float = 0.0
+    coindcx_spot_market: str = ""
+    coindcx_has_futures: bool = False
+    coindcx_futures_instrument: str = ""
+    coindcx_margin_asset: str = ""
+    coindcx_max_leverage_long: float = 0.0
+    coindcx_max_leverage_short: float = 0.0
 
 
 @dataclass
