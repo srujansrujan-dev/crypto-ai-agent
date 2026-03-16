@@ -22,7 +22,9 @@ from config import (
     LATEST_SIGNALS_LIMIT,
 )
 from learning_engine import (
+    enrich_signal_simulation,
     get_recent_signals,
+    get_simulation_stats,
     get_stats,
     get_storage_backend_name,
     load_weights,
@@ -270,8 +272,45 @@ HTML = """
     </div>
   </div>
 
+  <div class="section-title">Paper Simulation</div>
+  <div class="mini-grid">
+    <div class="mini-card">
+      <div class="k">Stake / Signal</div>
+      <div class="v">{{ fmt_inr(simulation.stake_inr) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Total Invested</div>
+      <div class="v">{{ fmt_inr(simulation.total_invested_inr) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Current Value</div>
+      <div class="v">{{ fmt_inr(simulation.current_value_inr) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Total P&amp;L</div>
+      <div class="v {{ 'win' if simulation.total_pnl_inr >= 0 else 'loss' }}">{{ fmt_inr(simulation.total_pnl_inr, show_sign=True) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Realized P&amp;L</div>
+      <div class="v {{ 'win' if simulation.realized_pnl_inr >= 0 else 'loss' }}">{{ fmt_inr(simulation.realized_pnl_inr, show_sign=True) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Unrealized P&amp;L</div>
+      <div class="v {{ 'win' if simulation.unrealized_pnl_inr >= 0 else 'loss' }}">{{ fmt_inr(simulation.unrealized_pnl_inr, show_sign=True) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Portfolio ROI</div>
+      <div class="v {{ 'win' if simulation.roi_pct >= 0 else 'loss' }}">{{ fmt_pct(simulation.roi_pct, 2) }}</div>
+    </div>
+    <div class="mini-card">
+      <div class="k">Open Paper Trades</div>
+      <div class="v">{{ simulation.open_trades }}</div>
+    </div>
+  </div>
+
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="latest">Latest</button>
+    <button class="tab-btn" data-tab="simulation">Simulation</button>
     <button class="tab-btn" data-tab="history">History</button>
     <button class="tab-btn" data-tab="futures">Futures Layer</button>
     <button class="tab-btn" data-tab="weights">Weights</button>
@@ -291,6 +330,8 @@ HTML = """
         <span>Entry: {{ fmt_money(best_signal.entry_price) }}</span>
         <span>Target: {{ fmt_money(best_signal.target_price) }}</span>
         <span>Stop: {{ fmt_money(best_signal.stop_loss) }}</span>
+        <span>Paper Value: {{ fmt_inr(best_signal.simulation_value_inr) }}</span>
+        <span>P&amp;L: {{ fmt_inr(best_signal.simulation_pnl_inr, show_sign=True) }}</span>
         <span>Confidence: {{ best_signal.confidence | int }}%</span>
         <span>Final: {{ (best_signal.aggregate_score or best_signal.quality_score or best_signal.pump_score) | int }}/100</span>
         <span>Regime: {{ best_signal.market_regime or "UNKNOWN" }}</span>
@@ -319,6 +360,8 @@ HTML = """
             <th>Stop</th>
             <th>Confidence</th>
             <th>Final</th>
+            <th>Paper P&amp;L</th>
+            <th>Paper Value</th>
             <th>Setup</th>
             <th>Suggested Lev</th>
             <th>Funding</th>
@@ -337,6 +380,8 @@ HTML = """
             <td>{{ fmt_money(s.stop_loss) }}</td>
             <td>{{ s.confidence | int }}%</td>
             <td>{{ (s.aggregate_score or s.quality_score or s.pump_score) | int }}/100</td>
+            <td class="{{ 'win' if s.simulation_pnl_inr >= 0 else 'loss' }}">{{ fmt_inr(s.simulation_pnl_inr, show_sign=True) }}</td>
+            <td>{{ fmt_inr(s.simulation_value_inr) }}</td>
             <td>{{ s.futures_bias or "UNAVAILABLE" }}</td>
             <td>{{ s.leverage_hint or "Unavailable" }}</td>
             <td>{{ fmt_pct(s.funding_rate, 4) }}</td>
@@ -349,6 +394,54 @@ HTML = """
     </div>
     {% else %}
     <p class="note">No live signals yet. The agent is still scanning the market.</p>
+    {% endif %}
+  </div>
+
+  <div id="tab-simulation" class="tab-panel">
+    <div class="section-title">Paper Trade History</div>
+    <p class="note">
+      Every published signal is treated as a fixed {{ fmt_inr(simulation.stake_inr) }} paper trade.
+      Closed trades use the recorded exit market price. Open trades are marked to the latest seen market price.
+    </p>
+    {% if history_signals %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Coin</th>
+            <th>Action</th>
+            <th>Outcome</th>
+            <th>Entry</th>
+            <th>Exit / Mark</th>
+            <th>Return</th>
+            <th>Stake</th>
+            <th>P&amp;L</th>
+            <th>Value</th>
+            <th>Age</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in history_signals %}
+          <tr>
+            <td style="color:#8b949e">{{ fmt_timestamp(s.timestamp) }}</td>
+            <td><strong>{{ s.symbol }}</strong><br><small style="color:#8b949e">{{ s.coin }}</small></td>
+            <td><span class="badge badge-{{ s.ai_action | lower }}">{{ s.ai_action }}</span></td>
+            <td><span class="badge badge-{{ s.outcome | lower }}">{{ s.outcome }}</span></td>
+            <td>{{ fmt_money(s.entry_price) }}</td>
+            <td>{{ fmt_money(s.simulation_exit_price) }}</td>
+            <td class="{{ 'win' if s.simulation_return_pct >= 0 else 'loss' }}">{{ fmt_pct(s.simulation_return_pct, 2) }}</td>
+            <td>{{ fmt_inr(s.simulation_stake_inr) }}</td>
+            <td class="{{ 'win' if s.simulation_pnl_inr >= 0 else 'loss' }}">{{ fmt_inr(s.simulation_pnl_inr, show_sign=True) }}</td>
+            <td>{{ fmt_inr(s.simulation_value_inr) }}</td>
+            <td>{{ fmt_age(s.simulation_age_hours) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="note">No paper trades yet. Once the agent publishes signals, this tab will start compounding the simulated history.</p>
     {% endif %}
   </div>
 
@@ -503,6 +596,17 @@ def _format_money(value):
     return f"${value:,.6f}"
 
 
+def _format_inr(value, show_sign=False):
+    if value is None:
+        return "-"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    prefix = "+" if show_sign and value > 0 else ""
+    return f"{prefix}Rs {value:,.2f}"
+
+
 def _format_compact(value):
     if value is None:
         return "-"
@@ -534,6 +638,21 @@ def _format_timestamp(value):
     if not value:
         return "-"
     return str(value)[:19]
+
+
+def _format_age(hours):
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        return "-"
+    total_minutes = max(0, int(round(hours * 60)))
+    days, rem_minutes = divmod(total_minutes, 1440)
+    rem_hours, minutes = divmod(rem_minutes, 60)
+    if days > 0:
+        return f"{days}d {rem_hours}h"
+    if rem_hours > 0:
+        return f"{rem_hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def _normalise_signal(signal: dict) -> dict:
@@ -578,10 +697,17 @@ def _is_live_trade_signal(signal: dict) -> bool:
 
 @app.route("/")
 def index():
-    recent_pool = [_normalise_signal(row) for row in get_recent_signals(max(LATEST_SIGNALS_LIMIT * 5, 40))]
+    recent_pool = [
+        enrich_signal_simulation(_normalise_signal(row))
+        for row in get_recent_signals(max(LATEST_SIGNALS_LIMIT * 5, 40))
+    ]
     latest_signals = [row for row in recent_pool if _is_live_trade_signal(row)][:LATEST_SIGNALS_LIMIT]
-    history_signals = [_normalise_signal(row) for row in get_recent_signals(HISTORY_SIGNALS_LIMIT)]
+    history_signals = [
+        enrich_signal_simulation(_normalise_signal(row))
+        for row in get_recent_signals(HISTORY_SIGNALS_LIMIT)
+    ]
     stats = get_stats()
+    simulation = get_simulation_stats()
     weights = load_weights()
     best_signal = _pick_best_signal(latest_signals)
     storage_backend = get_storage_backend_name()
@@ -591,12 +717,15 @@ def index():
         latest_signals=latest_signals,
         history_signals=history_signals,
         stats=stats,
+        simulation=simulation,
         weights=weights,
         best_signal=best_signal,
         storage_backend=storage_backend,
         fmt_money=_format_money,
+        fmt_inr=_format_inr,
         fmt_compact=_format_compact,
         fmt_pct=_format_pct,
+        fmt_age=_format_age,
         fmt_timestamp=_format_timestamp,
         now=now,
     )
@@ -605,7 +734,10 @@ def index():
 @app.route("/api/signals")
 def api_signals():
     limit = request.args.get("limit", default=LATEST_SIGNALS_LIMIT, type=int)
-    pool = [_normalise_signal(row) for row in get_recent_signals(max(limit * 5, 40))]
+    pool = [
+        enrich_signal_simulation(_normalise_signal(row))
+        for row in get_recent_signals(max(limit * 5, 40))
+    ]
     return jsonify([row for row in pool if _is_live_trade_signal(row)][:limit])
 
 
@@ -616,7 +748,7 @@ def api_history():
     outcome = request.args.get("outcome", default=None, type=str)
     return jsonify(
         [
-            _normalise_signal(row)
+            enrich_signal_simulation(_normalise_signal(row))
             for row in get_recent_signals(limit=limit, offset=offset, outcome=outcome)
         ]
     )
@@ -624,7 +756,9 @@ def api_history():
 
 @app.route("/api/stats")
 def api_stats():
-    return jsonify(get_stats())
+    payload = get_stats()
+    payload["simulation"] = get_simulation_stats()
+    return jsonify(payload)
 
 
 @app.route("/health")

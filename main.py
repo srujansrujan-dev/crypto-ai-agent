@@ -50,6 +50,7 @@ from learning_engine import (
     init_db,
     load_weights,
     save_signal,
+    update_signal_marks,
 )
 from market_intelligence import (
     analyse_deep_context,
@@ -618,6 +619,7 @@ def run_cycle(
         send_signal(signal)
         signals_this_cycle += 1
 
+    update_signal_marks(price_map)
     check_outcomes(price_map)
     new_weights = adjust_weights()
     detector.set_weights(new_weights)

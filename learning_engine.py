@@ -30,6 +30,7 @@ from config import (
     LEARNING_MIN_CLOSED_SIGNALS,
     SIGNAL_DEDUP_HOURS,
     SIGNAL_MAX_AGE_HOURS,
+    SIMULATION_STAKE_INR,
     WEIGHTS_PATH,
 )
 from signals import TradingSignal
@@ -79,6 +80,8 @@ _SIGNAL_COLUMN_TYPES = {
     "outcome": "TEXT DEFAULT 'PENDING'",
     "outcome_price": "REAL",
     "outcome_checked": "INTEGER DEFAULT 0",
+    "last_price": "REAL",
+    "last_price_updated_at": "TEXT",
 }
 
 
@@ -182,7 +185,9 @@ def _ensure_sqlite_schema(conn) -> None:
             futures_score    REAL    DEFAULT 0,
             outcome          TEXT    DEFAULT 'PENDING',
             outcome_price    REAL,
-            outcome_checked  INTEGER DEFAULT 0
+            outcome_checked  INTEGER DEFAULT 0,
+            last_price       REAL,
+            last_price_updated_at TEXT
         )
         """
     )
@@ -248,7 +253,9 @@ def _ensure_postgres_schema(conn) -> None:
             futures_score    DOUBLE PRECISION DEFAULT 0,
             outcome          TEXT DEFAULT 'PENDING',
             outcome_price    DOUBLE PRECISION,
-            outcome_checked  BOOLEAN DEFAULT FALSE
+            outcome_checked  BOOLEAN DEFAULT FALSE,
+            last_price       DOUBLE PRECISION,
+            last_price_updated_at TEXT
         )
         """
     )
@@ -433,25 +440,81 @@ def update_signal_outcome(signal_id: int, outcome: str, price: float) -> None:
     conn, backend = _connect()
     try:
         cur = conn.cursor()
+        updated_at = datetime.now(timezone.utc).isoformat()
         if backend == "postgres":
             cur.execute(
                 """
                 UPDATE signals
-                SET outcome = %s, outcome_price = %s, outcome_checked = %s
+                SET outcome = %s,
+                    outcome_price = %s,
+                    outcome_checked = %s,
+                    last_price = %s,
+                    last_price_updated_at = %s
                 WHERE id = %s
                 """,
-                (outcome, price, True, signal_id),
+                (outcome, price, True, price, updated_at, signal_id),
             )
         else:
             cur.execute(
                 """
                 UPDATE signals
-                SET outcome = ?, outcome_price = ?, outcome_checked = ?
+                SET outcome = ?,
+                    outcome_price = ?,
+                    outcome_checked = ?,
+                    last_price = ?,
+                    last_price_updated_at = ?
                 WHERE id = ?
                 """,
-                (outcome, price, 1, signal_id),
+                (outcome, price, 1, price, updated_at, signal_id),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_signal_marks(current_prices: Dict[str, float]) -> None:
+    """Mark pending signals to market using the latest scan prices."""
+    pending = get_pending_signals()
+    if not pending:
+        return
+
+    conn, backend = _connect()
+    try:
+        cur = conn.cursor()
+        updated = 0
+        updated_at = datetime.now(timezone.utc).isoformat()
+        for signal in pending:
+            asset_id = signal.get("asset_id") or ""
+            symbol = signal.get("symbol", "")
+            price = current_prices.get(asset_id) if asset_id else None
+            if price is None:
+                price = current_prices.get(symbol)
+            if price is None:
+                continue
+
+            if backend == "postgres":
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET last_price = %s, last_price_updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (price, updated_at, signal["id"]),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE signals
+                    SET last_price = ?, last_price_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (price, updated_at, signal["id"]),
+                )
+            updated += 1
+
+        if updated:
+            conn.commit()
+            logger.info("Marked %d pending signals to market.", updated)
     finally:
         conn.close()
 
@@ -520,6 +583,106 @@ def get_stats() -> dict:
         "closed": closed,
         "total": closed + pending,
         "win_rate": round(win_rate, 1),
+    }
+
+
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _signal_mark_price(signal: dict) -> float:
+    outcome = str(signal.get("outcome") or "PENDING").upper()
+    entry_price = _coerce_float(signal.get("entry_price"))
+    if outcome != "PENDING":
+        return _coerce_float(signal.get("outcome_price"), entry_price)
+    return _coerce_float(signal.get("last_price"), entry_price)
+
+
+def _signal_return_pct(signal: dict, exit_price: float) -> float:
+    entry_price = _coerce_float(signal.get("entry_price"))
+    if entry_price <= 0:
+        return 0.0
+    if str(signal.get("ai_action") or "").upper() == "SHORT":
+        return ((entry_price - exit_price) / entry_price) * 100.0
+    return ((exit_price - entry_price) / entry_price) * 100.0
+
+
+def enrich_signal_simulation(signal: dict, stake_inr: float = SIMULATION_STAKE_INR) -> dict:
+    """Add paper-trading metrics for a fixed INR stake per signal."""
+    enriched = dict(signal)
+    exit_price = _signal_mark_price(enriched)
+    return_pct = _signal_return_pct(enriched, exit_price)
+    value_inr = max(0.0, stake_inr * (1 + return_pct / 100.0))
+    pnl_inr = value_inr - stake_inr
+
+    created_at = _parse_timestamp(enriched.get("timestamp"))
+    age_hours = 0.0
+    if created_at is not None:
+        age_hours = max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds() / 3600.0)
+
+    enriched["simulation_stake_inr"] = round(stake_inr, 2)
+    enriched["simulation_exit_price"] = round(exit_price, 8)
+    enriched["simulation_return_pct"] = round(return_pct, 2)
+    enriched["simulation_value_inr"] = round(value_inr, 2)
+    enriched["simulation_pnl_inr"] = round(pnl_inr, 2)
+    enriched["simulation_age_hours"] = round(age_hours, 2)
+    enriched["simulation_is_closed"] = str(enriched.get("outcome") or "").upper() != "PENDING"
+    return enriched
+
+
+def get_simulation_stats(stake_inr: float = SIMULATION_STAKE_INR) -> dict:
+    """Return portfolio-level paper-trading totals for all signals."""
+    conn, backend = _connect(row_factory=True)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signals ORDER BY id DESC")
+        rows = _rows_to_dicts(cur.fetchall())
+    finally:
+        conn.close()
+
+    if not rows:
+        return {
+            "stake_inr": round(stake_inr, 2),
+            "total_trades": 0,
+            "closed_trades": 0,
+            "open_trades": 0,
+            "total_invested_inr": 0.0,
+            "current_value_inr": 0.0,
+            "realized_pnl_inr": 0.0,
+            "unrealized_pnl_inr": 0.0,
+            "total_pnl_inr": 0.0,
+            "roi_pct": 0.0,
+        }
+
+    enriched_rows = [enrich_signal_simulation(row, stake_inr) for row in rows]
+    closed_rows = [row for row in enriched_rows if row["simulation_is_closed"]]
+    open_rows = [row for row in enriched_rows if not row["simulation_is_closed"]]
+    total_invested = stake_inr * len(enriched_rows)
+    current_value = sum(row["simulation_value_inr"] for row in enriched_rows)
+    realized_pnl = sum(row["simulation_pnl_inr"] for row in closed_rows)
+    unrealized_pnl = sum(row["simulation_pnl_inr"] for row in open_rows)
+    total_pnl = current_value - total_invested
+    roi_pct = (total_pnl / total_invested * 100.0) if total_invested else 0.0
+
+    return {
+        "stake_inr": round(stake_inr, 2),
+        "total_trades": len(enriched_rows),
+        "closed_trades": len(closed_rows),
+        "open_trades": len(open_rows),
+        "total_invested_inr": round(total_invested, 2),
+        "current_value_inr": round(current_value, 2),
+        "realized_pnl_inr": round(realized_pnl, 2),
+        "unrealized_pnl_inr": round(unrealized_pnl, 2),
+        "total_pnl_inr": round(total_pnl, 2),
+        "roi_pct": round(roi_pct, 2),
     }
 
 
