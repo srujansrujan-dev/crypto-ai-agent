@@ -44,6 +44,9 @@ class PumpScore:
     """Pump-detection scoring breakdown."""
     symbol:            str
     total_score:       float = 0.0
+    direction:         str = "LONG"
+    long_score:        float = 0.0
+    short_score:       float = 0.0
     volume_spike:      float = 0.0
     price_change:      float = 0.0
     momentum_breakout: float = 0.0
@@ -64,7 +67,7 @@ class TradingSignal:
     buy_zone_low:    float
     buy_zone_high:   float
     confidence:      float             # 0-100
-    ai_action:       str               # BUY / HOLD / AVOID
+    ai_action:       str               # BUY / SHORT / HOLD / AVOID
     ai_reason:       str
     pump_score:      float
     quality_score:   float
@@ -80,8 +83,8 @@ class TradingSignal:
     rsi:             float
     market_cap:      float
     price_change_24h: float
-    futures_bias:    str = "NO-DATA"
-    leverage_hint:   str = "1x"
+    futures_bias:    str = "UNAVAILABLE"
+    leverage_hint:   str = "Unavailable"
     futures_exchange: str = ""
     futures_symbol:  str = ""
     funding_rate:    float = 0.0
@@ -96,3 +99,7 @@ class TradingSignal:
 
     def to_dict(self) -> dict:
         return self.__dict__
+
+    @property
+    def is_short(self) -> bool:
+        return str(self.ai_action).upper() == "SHORT"

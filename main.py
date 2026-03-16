@@ -76,6 +76,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _direction_from_action(action: str, fallback: str = "LONG") -> str:
+    return "SHORT" if str(action or fallback).upper() == "SHORT" else "LONG"
+
+
+def _trend_score_for_direction(trend_info, direction: str) -> float:
+    if not trend_info:
+        return 0.0
+    if direction == "SHORT":
+        return float(trend_info.get("bearish_trend_score", trend_info.get("trend_score", 0.0)) or 0.0)
+    return float(trend_info.get("bullish_trend_score", trend_info.get("trend_score", 0.0)) or 0.0)
+
+
+def _directional_deep_score(deep_context, direction: str) -> float:
+    if direction == "SHORT":
+        return float(deep_context.get("short_deep_score", deep_context.get("deep_score", 0.0)) or 0.0)
+    return float(deep_context.get("long_deep_score", deep_context.get("deep_score", 0.0)) or 0.0)
+
+
+def _momentum_strength(ind, direction: str) -> float:
+    return max(ind.momentum, 0.0) if direction == "LONG" else abs(min(ind.momentum, 0.0))
+
+
+def _ma_alignment(snap, ind, direction: str) -> bool:
+    ma20 = ind.ma20 or snap.current_price
+    ma50 = ind.ma50 or snap.current_price
+    if direction == "SHORT":
+        return snap.current_price <= ma20 and snap.current_price <= ma50
+    return snap.current_price >= ma20 and snap.current_price >= ma50
+
+
 def build_signal(
     snap,
     ind,
@@ -91,9 +121,16 @@ def build_signal(
     trend_score,
 ) -> TradingSignal:
     entry = snap.current_price
+    direction = _direction_from_action(ai_action, futures_context.get("trade_bias", "LONG"))
+    is_short = direction == "SHORT"
+    target_price = round(entry * (1 - DEFAULT_TARGET_PCT), 8) if is_short else round(entry * (1 + DEFAULT_TARGET_PCT), 8)
+    stop_loss = round(entry * (1 + DEFAULT_STOP_LOSS_PCT), 8) if is_short else round(entry * (1 - DEFAULT_STOP_LOSS_PCT), 8)
+    zone_low = round(entry * 0.99, 8)
+    zone_high = round(entry * 1.01, 8)
+
     context_suffix = (
         f" Regime: {regime.get('label', 'UNKNOWN')} ({regime.get('score', 50):.0f}/100)."
-        f" Deep score: {deep_context.get('deep_score', 0):.0f}/100."
+        f" Deep score: {_directional_deep_score(deep_context, direction):.0f}/100."
         f" Liquidity: {deep_context.get('liquidity_score', 0):.0f}/100."
         f" Risk proxy: {deep_context.get('risk_score', 0):.0f}/100."
     )
@@ -102,10 +139,11 @@ def build_signal(
         context_suffix += f" Note: {risk_notes[0]}."
     if futures_context.get("has_data"):
         context_suffix += (
-            f" CoinDCX futures: {futures_context.get('trade_bias', 'NO-DATA')} bias, "
-            f"recommended {futures_context.get('leverage_hint', '1x')} leverage, "
-            f"funding {futures_context.get('funding_rate', 0.0):.4f}, "
-            f"OI {futures_context.get('open_interest', 0.0):,.0f}."
+            f" CoinDCX futures setup: {futures_context.get('trade_bias', 'UNAVAILABLE')},"
+            f" recommended {futures_context.get('leverage_hint', '1x')} leverage,"
+            f" funding {futures_context.get('funding_rate', 0.0):.4f},"
+            f" OI {futures_context.get('open_interest', 0.0):,.0f},"
+            f" execution matrix {futures_context.get('futures_score', 0.0):.0f}/100."
         )
 
     return TradingSignal(
@@ -114,17 +152,17 @@ def build_signal(
         symbol=snap.symbol,
         timestamp=datetime.now(timezone.utc).isoformat(),
         entry_price=entry,
-        target_price=round(entry * (1 + DEFAULT_TARGET_PCT), 8),
-        stop_loss=round(entry * (1 - DEFAULT_STOP_LOSS_PCT), 8),
-        buy_zone_low=round(entry * 0.99, 8),
-        buy_zone_high=round(entry * 1.01, 8),
+        target_price=target_price,
+        stop_loss=stop_loss,
+        buy_zone_low=zone_low,
+        buy_zone_high=zone_high,
         confidence=ai_confidence,
         ai_action=ai_action,
         ai_reason=f"{ai_reason}{context_suffix}",
         pump_score=pump_score.total_score,
         quality_score=quality_score,
         aggregate_score=final_score,
-        deep_score=deep_context.get("deep_score", 0.0),
+        deep_score=_directional_deep_score(deep_context, direction),
         liquidity_score=deep_context.get("liquidity_score", 0.0),
         risk_score=deep_context.get("risk_score", 0.0),
         market_regime=regime.get("label", "UNKNOWN"),
@@ -135,8 +173,8 @@ def build_signal(
         rsi=float(ind.rsi or 50.0),
         market_cap=snap.market_cap,
         price_change_24h=snap.price_change_24h,
-        futures_bias=futures_context.get("trade_bias", "NO-DATA"),
-        leverage_hint=futures_context.get("leverage_hint", "1x"),
+        futures_bias=futures_context.get("trade_bias", "UNAVAILABLE"),
+        leverage_hint=futures_context.get("leverage_hint", "Unavailable"),
         futures_exchange=futures_context.get("futures_exchange", ""),
         futures_symbol=futures_context.get("futures_symbol", ""),
         funding_rate=futures_context.get("funding_rate", 0.0),
@@ -149,26 +187,34 @@ def build_signal(
 
 
 def rank_opportunity(snap, ind, pump_score, trend_info) -> float:
-    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    direction = _direction_from_action(getattr(pump_score, "direction", "LONG"))
+    trend_score = _trend_score_for_direction(trend_info, direction)
     rsi = ind.rsi or 50.0
-    above_mas = (
-        snap.current_price >= (ind.ma20 or snap.current_price)
-        and snap.current_price >= (ind.ma50 or snap.current_price)
-    )
 
     score = pump_score.total_score
     score += min(ind.volume_ratio, 6.0) * 2.5
-    score += min(max(ind.momentum, 0.0), 20.0)
+    score += min(_momentum_strength(ind, direction), 20.0)
     score += min(trend_score, 60.0) * 0.2
-    if above_mas:
+    if _ma_alignment(snap, ind, direction):
         score += 6
-    if 45 <= rsi <= 68:
-        score += 6
-    elif rsi > 78:
-        score -= 18
-    elif rsi > 72:
-        score -= 10
-    score -= min(max(snap.price_change_24h - 18.0, 0.0), 12.0) * 0.8
+
+    if direction == "LONG":
+        if 45 <= rsi <= 68:
+            score += 6
+        elif rsi > 78:
+            score -= 18
+        elif rsi > 72:
+            score -= 10
+        score -= min(max(snap.price_change_24h - 18.0, 0.0), 12.0) * 0.8
+    else:
+        if 34 <= rsi <= 58:
+            score += 6
+        elif rsi < 22:
+            score -= 18
+        elif rsi < 28:
+            score -= 10
+        score -= min(max(abs(min(snap.price_change_24h, 0.0)) - 18.0, 0.0), 12.0) * 0.8
+
     return round(score, 2)
 
 
@@ -180,32 +226,40 @@ def calculate_signal_quality(
     ai_confidence,
     trend_info,
 ) -> float:
-    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    direction = _direction_from_action(ai_action, getattr(pump_score, "direction", "LONG"))
+    trend_score = _trend_score_for_direction(trend_info, direction)
     rsi = ind.rsi or 50.0
-    above_mas = (
-        snap.current_price >= (ind.ma20 or snap.current_price)
-        and snap.current_price >= (ind.ma50 or snap.current_price)
-    )
 
     quality = pump_score.total_score * 0.42 + ai_confidence * 0.33
     quality += min(ind.volume_ratio / 5.0, 1.0) * 10
-    quality += min(max(ind.momentum, 0.0) / 18.0, 1.0) * 10
+    quality += min(_momentum_strength(ind, direction) / 18.0, 1.0) * 10
     quality += min(trend_score / 60.0, 1.0) * 12
-    quality += {"BUY": 12, "HOLD": -8, "AVOID": -20}.get(ai_action, 0)
+    quality += {"BUY": 12, "SHORT": 12, "HOLD": -8, "AVOID": -20}.get(ai_action, 0)
 
-    if above_mas:
+    if _ma_alignment(snap, ind, direction):
         quality += 6
 
-    if rsi > 78:
-        quality -= 18
-    elif rsi > 72:
-        quality -= 10
-    elif rsi < 25:
-        quality -= 8
-    elif 45 <= rsi <= 68:
-        quality += 6
+    if direction == "LONG":
+        if rsi > 78:
+            quality -= 18
+        elif rsi > 72:
+            quality -= 10
+        elif rsi < 25:
+            quality -= 8
+        elif 45 <= rsi <= 68:
+            quality += 6
+        quality -= min(max(snap.price_change_24h - 15.0, 0.0), 15.0) * 0.6
+    else:
+        if rsi < 22:
+            quality -= 18
+        elif rsi < 28:
+            quality -= 10
+        elif rsi > 75:
+            quality -= 6
+        elif 34 <= rsi <= 58:
+            quality += 6
+        quality -= min(max(abs(min(snap.price_change_24h, 0.0)) - 15.0, 0.0), 15.0) * 0.6
 
-    quality -= min(max(snap.price_change_24h - 15.0, 0.0), 15.0) * 0.6
     if snap.market_cap <= 0:
         quality -= 4
 
@@ -221,37 +275,49 @@ def calculate_final_base_score(
     quality_score,
     trend_info,
 ) -> float:
-    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    direction = _direction_from_action(ai_action, getattr(pump_score, "direction", "LONG"))
+    trend_score = _trend_score_for_direction(trend_info, direction)
     rsi = ind.rsi or 50.0
-    above_mas = (
-        snap.current_price >= (ind.ma20 or snap.current_price)
-        and snap.current_price >= (ind.ma50 or snap.current_price)
-    )
 
     final_score = pump_score.total_score * 0.28
     final_score += quality_score * 0.34
     final_score += ai_confidence * 0.18
     final_score += min(trend_score, 60.0) * 0.10
     final_score += min(ind.volume_ratio, 6.0) * 2.2
-    final_score += min(max(ind.momentum, 0.0), 20.0) * 0.55
-    final_score += {"BUY": 8, "HOLD": -10, "AVOID": -24}.get(ai_action, -8)
+    final_score += min(_momentum_strength(ind, direction), 20.0) * 0.55
+    final_score += {"BUY": 8, "SHORT": 8, "HOLD": -10, "AVOID": -24}.get(ai_action, -8)
 
-    if above_mas:
+    if _ma_alignment(snap, ind, direction):
         final_score += 4
 
-    if 45 <= rsi <= 68:
-        final_score += 4
-    elif rsi > 78:
-        final_score -= 18
-    elif rsi > 72:
-        final_score -= 10
-    elif rsi < 25:
-        final_score -= 6
+    if direction == "LONG":
+        if 45 <= rsi <= 68:
+            final_score += 4
+        elif rsi > 78:
+            final_score -= 18
+        elif rsi > 72:
+            final_score -= 10
+        elif rsi < 25:
+            final_score -= 6
 
-    if snap.price_change_24h >= 18:
-        final_score -= 8
-    elif snap.price_change_24h >= 12:
-        final_score -= 4
+        if snap.price_change_24h >= 18:
+            final_score -= 8
+        elif snap.price_change_24h >= 12:
+            final_score -= 4
+    else:
+        if 34 <= rsi <= 58:
+            final_score += 4
+        elif rsi < 22:
+            final_score -= 18
+        elif rsi < 28:
+            final_score -= 10
+        elif rsi > 75:
+            final_score -= 4
+
+        if snap.price_change_24h <= -18:
+            final_score -= 8
+        elif snap.price_change_24h <= -12:
+            final_score -= 4
 
     return round(max(0.0, min(100.0, final_score)), 2)
 
@@ -268,11 +334,12 @@ def should_emit_signal(
     regime,
     trend_info,
 ) -> bool:
-    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
+    direction = _direction_from_action(ai_action, getattr(pump_score, "direction", "LONG"))
+    trend_score = _trend_score_for_direction(trend_info, direction)
     liquidity_score = deep_context.get("liquidity_score", 0.0)
     risk_score = deep_context.get("risk_score", 0.0)
     market_regime = regime.get("label", "UNKNOWN")
-    futures_bias = futures_context.get("trade_bias", "NO-DATA")
+    futures_bias = futures_context.get("trade_bias", "UNAVAILABLE")
     futures_score = futures_context.get("futures_score", 0.0)
 
     if ai_action not in ALLOWED_SIGNAL_ACTIONS:
@@ -282,68 +349,94 @@ def should_emit_signal(
     if ai_confidence < MIN_SIGNAL_CONFIDENCE:
         logger.info(
             "Rejecting %s because confidence %.1f is below %.1f",
-            snap.symbol, ai_confidence, MIN_SIGNAL_CONFIDENCE,
+            snap.symbol,
+            ai_confidence,
+            MIN_SIGNAL_CONFIDENCE,
         )
         return False
 
     if pump_score.total_score < MIN_SIGNAL_PUMP_SCORE:
         logger.info(
-            "Rejecting %s because pump score %.1f is below %.1f",
-            snap.symbol, pump_score.total_score, MIN_SIGNAL_PUMP_SCORE,
+            "Rejecting %s because opportunity score %.1f is below %.1f",
+            snap.symbol,
+            pump_score.total_score,
+            MIN_SIGNAL_PUMP_SCORE,
         )
         return False
 
     if quality_score < MIN_SIGNAL_QUALITY_SCORE:
         logger.info(
             "Rejecting %s because quality %.1f is below %.1f",
-            snap.symbol, quality_score, MIN_SIGNAL_QUALITY_SCORE,
+            snap.symbol,
+            quality_score,
+            MIN_SIGNAL_QUALITY_SCORE,
         )
         return False
 
     if final_score < MIN_SIGNAL_FINAL_SCORE:
         logger.info(
             "Rejecting %s because final score %.1f is below %.1f",
-            snap.symbol, final_score, MIN_SIGNAL_FINAL_SCORE,
+            snap.symbol,
+            final_score,
+            MIN_SIGNAL_FINAL_SCORE,
         )
         return False
 
     if trend_info and trend_score < MIN_SIGNAL_TREND_SCORE and pump_score.total_score < 95:
         logger.info(
-            "Rejecting %s because trend score %.1f is below %.1f",
-            snap.symbol, trend_score, MIN_SIGNAL_TREND_SCORE,
+            "Rejecting %s because directional trend score %.1f is below %.1f",
+            snap.symbol,
+            trend_score,
+            MIN_SIGNAL_TREND_SCORE,
         )
         return False
 
     if liquidity_score < MIN_SIGNAL_LIQUIDITY_SCORE:
         logger.info(
             "Rejecting %s because liquidity %.1f is below %.1f",
-            snap.symbol, liquidity_score, MIN_SIGNAL_LIQUIDITY_SCORE,
+            snap.symbol,
+            liquidity_score,
+            MIN_SIGNAL_LIQUIDITY_SCORE,
         )
         return False
 
     if risk_score > MAX_SIGNAL_RISK_SCORE:
         logger.info(
             "Rejecting %s because risk proxy %.1f is above %.1f",
-            snap.symbol, risk_score, MAX_SIGNAL_RISK_SCORE,
+            snap.symbol,
+            risk_score,
+            MAX_SIGNAL_RISK_SCORE,
         )
         return False
 
-    if market_regime == "PANIC" and snap.symbol not in {"BTC", "ETH", "SOL"}:
-        logger.info("Rejecting %s because market regime is PANIC", snap.symbol)
+    if direction == "LONG" and market_regime == "PANIC" and snap.symbol not in {"BTC", "ETH", "SOL"}:
+        logger.info("Rejecting %s because market regime is PANIC for longs", snap.symbol)
+        return False
+    if direction == "SHORT" and market_regime == "RISK_ON" and snap.symbol not in {"BTC", "ETH", "SOL"}:
+        logger.info("Rejecting %s because shorting into a strong risk-on regime is lower quality", snap.symbol)
         return False
 
-    if futures_context.get("has_data"):
-        if futures_bias == "SHORT":
-            logger.info("Rejecting %s because futures bias is SHORT", snap.symbol)
-            return False
-        if futures_bias == "NO-TRADE" and futures_score < MIN_FUTURES_CONFIRMATION:
-            logger.info(
-                "Rejecting %s because futures confirmation %.1f is below %.1f",
-                snap.symbol,
-                futures_score,
-                MIN_FUTURES_CONFIRMATION,
-            )
-            return False
+    if not futures_context.get("has_data"):
+        logger.info("Rejecting %s because CoinDCX futures data is unavailable", snap.symbol)
+        return False
+
+    if (direction == "LONG" and futures_bias != "LONG") or (direction == "SHORT" and futures_bias != "SHORT"):
+        logger.info(
+            "Rejecting %s because action %s does not align with CoinDCX futures setup %s",
+            snap.symbol,
+            ai_action,
+            futures_bias,
+        )
+        return False
+
+    if futures_score < MIN_FUTURES_CONFIRMATION:
+        logger.info(
+            "Rejecting %s because futures execution score %.1f is below %.1f",
+            snap.symbol,
+            futures_score,
+            MIN_FUTURES_CONFIRMATION,
+        )
+        return False
 
     return True
 
@@ -353,11 +446,11 @@ def run_cycle(
     detector: PumpDetector,
     trends: TrendDetector,
 ) -> None:
-    logger.info("â”€â”€ Cycle %d starting â”€â”€", cycle)
+    logger.info("----- Cycle %d starting -----", cycle)
 
     snapshots = fetch_market_data()
     if not snapshots:
-        logger.warning("No market data returned â€” skipping cycle.")
+        logger.warning("No market data returned - skipping cycle.")
         return
 
     price_map = {snap.id: snap.current_price for snap in snapshots}
@@ -366,7 +459,7 @@ def run_cycle(
 
     market_regime = classify_market_regime(snapshots)
     logger.info(
-        "Market regime â€” %s score=%.1f breadth24=%.2f median24h=%.2f%%",
+        "Market regime - %s score=%.1f breadth24=%.2f median24h=%.2f%%",
         market_regime["label"],
         market_regime["score"],
         market_regime["breadth_24h"],
@@ -390,6 +483,7 @@ def run_cycle(
                 "trend_info": trend_info,
             }
         )
+
     if COINDCX_FUTURES_ONLY:
         logger.info("CoinDCX futures-eligible opportunities: %d", len(rough_candidates))
     rough_candidates.sort(key=lambda item: item["rough_score"], reverse=True)
@@ -421,7 +515,7 @@ def run_cycle(
             f"{item['snapshot'].symbol}:{item['watchlist_score']:.1f}"
             for item in watchlist[:WATCHLIST_LOG_LIMIT]
         )
-        logger.info("Internal watchlist â€” %s", top_watchlist)
+        logger.info("Internal watchlist - %s", top_watchlist)
 
     derivatives = fetch_derivatives_tickers() if watchlist else []
 
@@ -432,18 +526,36 @@ def run_cycle(
         pump = candidate["pump"]
         trend_info = candidate["trend_info"]
         deep_context = candidate["deep_context"]
-        futures_context = summarize_futures_context(snap, market_regime, derivatives)
+        futures_context = summarize_futures_context(
+            snap,
+            ind,
+            trend_info,
+            deep_context,
+            market_regime,
+            derivatives,
+        )
 
         if has_recent_pending_signal(snap.id, snap.symbol):
-            logger.info("Skipping %s â€” recent pending signal already exists", snap.symbol)
+            logger.info("Skipping %s - recent pending signal already exists", snap.symbol)
             continue
 
         action, confidence, reason = analyse(snap, ind, pump, trend_info, futures_context)
         quality_score = calculate_signal_quality(
-            snap, ind, pump, action, confidence, trend_info,
+            snap,
+            ind,
+            pump,
+            action,
+            confidence,
+            trend_info,
         )
         base_final_score = calculate_final_base_score(
-            snap, ind, pump, action, confidence, quality_score, trend_info,
+            snap,
+            ind,
+            pump,
+            action,
+            confidence,
+            quality_score,
+            trend_info,
         )
         final_score = calculate_final_publish_score(
             snap,
@@ -470,10 +582,6 @@ def run_cycle(
         ):
             continue
 
-        if action == "AVOID":
-            logger.info("Skipping %s â€” AI says AVOID", snap.symbol)
-            continue
-
         signal = build_signal(
             snap,
             ind,
@@ -486,7 +594,10 @@ def run_cycle(
             deep_context,
             futures_context,
             market_regime,
-            trend_info.get("trend_score", 0.0) if trend_info else 0.0,
+            _trend_score_for_direction(
+                trend_info,
+                _direction_from_action(action, getattr(pump, "direction", "LONG")),
+            ),
         )
         candidate_signals.append(signal)
 
@@ -514,8 +625,10 @@ def run_cycle(
     send_cycle_summary(cycle, len(snapshots), len(opportunities), signals_this_cycle)
     stats = get_stats()
     logger.info(
-        "Stats â€” Total: %d | Win rate: %.1f%% | Pending: %d",
-        stats["total"], stats["win_rate"], stats["pending"],
+        "Stats - Total: %d | Win rate: %.1f%% | Pending: %d",
+        stats["total"],
+        stats["win_rate"],
+        stats["pending"],
     )
 
 
@@ -535,13 +648,13 @@ def main() -> None:
         try:
             run_cycle(cycle, detector, trends)
         except KeyboardInterrupt:
-            logger.info("Shutdown requested â€” exiting.")
+            logger.info("Shutdown requested - exiting.")
             break
         except Exception as exc:
             logger.exception("Unhandled error in cycle %d: %s", cycle, exc)
 
         cycle += 1
-        logger.info("Sleeping %ds until next cycle â€¦", SCAN_INTERVAL_SECONDS)
+        logger.info("Sleeping %ds until next cycle...", SCAN_INTERVAL_SECONDS)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 

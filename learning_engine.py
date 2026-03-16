@@ -66,8 +66,8 @@ _SIGNAL_COLUMN_TYPES = {
     "rsi": "REAL DEFAULT 50",
     "market_cap": "REAL DEFAULT 0",
     "price_change_24h": "REAL DEFAULT 0",
-    "futures_bias": "TEXT DEFAULT 'NO-DATA'",
-    "leverage_hint": "TEXT DEFAULT '1x'",
+    "futures_bias": "TEXT DEFAULT 'UNAVAILABLE'",
+    "leverage_hint": "TEXT DEFAULT 'Unavailable'",
     "futures_exchange": "TEXT DEFAULT ''",
     "futures_symbol": "TEXT DEFAULT ''",
     "funding_rate": "REAL DEFAULT 0",
@@ -170,8 +170,8 @@ def _ensure_sqlite_schema(conn) -> None:
             rsi              REAL    DEFAULT 50,
             market_cap       REAL    DEFAULT 0,
             price_change_24h REAL    DEFAULT 0,
-            futures_bias     TEXT    DEFAULT 'NO-DATA',
-            leverage_hint    TEXT    DEFAULT '1x',
+            futures_bias     TEXT    DEFAULT 'UNAVAILABLE',
+            leverage_hint    TEXT    DEFAULT 'Unavailable',
             futures_exchange TEXT    DEFAULT '',
             futures_symbol   TEXT    DEFAULT '',
             funding_rate     REAL    DEFAULT 0,
@@ -236,8 +236,8 @@ def _ensure_postgres_schema(conn) -> None:
             rsi              DOUBLE PRECISION DEFAULT 50,
             market_cap       DOUBLE PRECISION DEFAULT 0,
             price_change_24h DOUBLE PRECISION DEFAULT 0,
-            futures_bias     TEXT DEFAULT 'NO-DATA',
-            leverage_hint    TEXT DEFAULT '1x',
+            futures_bias     TEXT DEFAULT 'UNAVAILABLE',
+            leverage_hint    TEXT DEFAULT 'Unavailable',
             futures_exchange TEXT DEFAULT '',
             futures_symbol   TEXT DEFAULT '',
             funding_rate     DOUBLE PRECISION DEFAULT 0,
@@ -655,17 +655,33 @@ def check_outcomes(current_prices: Dict[str, float]) -> None:
     for signal in pending:
         asset_id = signal.get("asset_id") or ""
         symbol = signal.get("symbol", "")
+        action = str(signal.get("ai_action") or "BUY").upper()
         price = current_prices.get(asset_id) if asset_id else None
         if price is None:
             price = current_prices.get(symbol)
 
-        if price is not None and price >= _coerce_float(signal.get("target_price")):
-            update_signal_outcome(signal["id"], "WIN", price)
-            updated += 1
-        elif price is not None and price <= _coerce_float(signal.get("stop_loss")):
-            update_signal_outcome(signal["id"], "LOSS", price)
-            updated += 1
-        elif _is_signal_stale(signal.get("timestamp")):
+        target_price = _coerce_float(signal.get("target_price"))
+        stop_loss = _coerce_float(signal.get("stop_loss"))
+        resolved = False
+        if action == "SHORT":
+            if price is not None and price <= target_price:
+                update_signal_outcome(signal["id"], "WIN", price)
+                updated += 1
+                resolved = True
+            elif price is not None and price >= stop_loss:
+                update_signal_outcome(signal["id"], "LOSS", price)
+                updated += 1
+                resolved = True
+        else:
+            if price is not None and price >= target_price:
+                update_signal_outcome(signal["id"], "WIN", price)
+                updated += 1
+                resolved = True
+            elif price is not None and price <= stop_loss:
+                update_signal_outcome(signal["id"], "LOSS", price)
+                updated += 1
+                resolved = True
+        if not resolved and _is_signal_stale(signal.get("timestamp")):
             fallback_price = price
             if fallback_price is None:
                 fallback_price = _coerce_float(signal.get("entry_price"))
@@ -680,21 +696,35 @@ def _normalize_volume_ratio(volume_ratio: float) -> float:
     return max(0.0, min(1.0, (volume_ratio - 1.0) / 4.0))
 
 
-def _normalize_price_change(price_change_24h: float, rsi: float) -> float:
-    base = max(0.0, min(1.0, (price_change_24h - 2.0) / 12.0))
-    if rsi > 78:
-        base *= 0.35
-    elif rsi > 72:
-        base *= 0.6
-    elif 45 <= rsi <= 68:
-        base *= 1.0
+def _normalize_price_change(price_change_24h: float, rsi: float, action: str) -> float:
+    magnitude = abs(price_change_24h)
+    base = max(0.0, min(1.0, (magnitude - 2.0) / 12.0))
+    if str(action).upper() == "SHORT":
+        if rsi < 22:
+            base *= 0.35
+        elif rsi < 28:
+            base *= 0.6
+        elif 34 <= rsi <= 58:
+            base *= 1.0
+        else:
+            base *= 0.85
     else:
-        base *= 0.85
+        if rsi > 78:
+            base *= 0.35
+        elif rsi > 72:
+            base *= 0.6
+        elif 45 <= rsi <= 68:
+            base *= 1.0
+        else:
+            base *= 0.85
     return max(0.0, min(1.0, base))
 
 
-def _normalize_momentum(momentum: float, trend_score: float) -> float:
-    base = max(0.0, min(1.0, momentum / 15.0))
+def _normalize_momentum(momentum: float, trend_score: float, action: str) -> float:
+    if str(action).upper() == "SHORT":
+        base = max(0.0, min(1.0, abs(min(momentum, 0.0)) / 15.0))
+    else:
+        base = max(0.0, min(1.0, max(momentum, 0.0) / 15.0))
     trend = max(0.0, min(1.0, trend_score / 50.0))
     return max(0.0, min(1.0, base * 0.6 + trend * 0.4))
 
@@ -722,6 +752,7 @@ def _feature_bias(rows: List[dict]) -> dict:
         outcome_score = outcome_scores.get(row.get("outcome"))
         if outcome_score is None:
             continue
+        action = str(row.get("ai_action") or "BUY").upper()
 
         quality = _coerce_float(
             row.get("aggregate_score"),
@@ -739,10 +770,12 @@ def _feature_bias(rows: List[dict]) -> dict:
             "price_change": _normalize_price_change(
                 _coerce_float(row.get("price_change_24h")),
                 _coerce_float(row.get("rsi"), 50.0),
+                action,
             ),
             "momentum_breakout": _normalize_momentum(
                 _coerce_float(row.get("momentum")),
                 _coerce_float(row.get("trend_score")),
+                action,
             ),
             "small_cap": _normalize_small_cap(
                 _coerce_float(row.get("market_cap"))

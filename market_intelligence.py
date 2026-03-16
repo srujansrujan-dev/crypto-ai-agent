@@ -20,6 +20,10 @@ from scanner import fetch_coindcx_futures_prices, fetch_coindcx_instrument_detai
 from signals import IndicatorSet, MarketSnapshot, PumpScore
 
 MAJOR_SYMBOLS = {"BTC", "ETH", "SOL", "BNB", "XRP"}
+FUTURES_UNAVAILABLE = "UNAVAILABLE"
+FUTURES_WAIT = "WAIT"
+FUTURES_LONG = "LONG"
+FUTURES_SHORT = "SHORT"
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -29,6 +33,38 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _directional_trend_score(trend_info: Optional[dict], direction: str) -> float:
+    if not trend_info:
+        return 0.0
+    if direction == FUTURES_SHORT:
+        return _safe_float(
+            trend_info.get("bearish_trend_score", trend_info.get("trend_score", 0.0)),
+            0.0,
+        )
+    return _safe_float(
+        trend_info.get("bullish_trend_score", trend_info.get("trend_score", 0.0)),
+        0.0,
+    )
+
+
+def _directional_deep_score(deep_context: dict, direction: str) -> float:
+    if direction == FUTURES_SHORT:
+        return _safe_float(deep_context.get("short_deep_score", deep_context.get("deep_score", 0.0)), 0.0)
+    return _safe_float(deep_context.get("long_deep_score", deep_context.get("deep_score", 0.0)), 0.0)
+
+
+def _action_matches_bias(action: str, bias: str) -> bool:
+    action_upper = str(action or "").upper()
+    bias_upper = str(bias or "").upper()
+    return (action_upper == "BUY" and bias_upper == FUTURES_LONG) or (
+        action_upper == "SHORT" and bias_upper == FUTURES_SHORT
+    )
 
 
 def _weighted_average(rows: List[dict], value_key: str, weight_key: str) -> float:
@@ -182,43 +218,85 @@ def analyse_deep_context(
         liquidity_score += 4
     liquidity_score = max(0.0, min(100.0, liquidity_score))
 
-    trend_score = trend_info.get("trend_score", 0.0) if trend_info else 0.0
-    above_mas = snapshot.current_price >= (indicators.ma20 or snapshot.current_price) and snapshot.current_price >= (
-        indicators.ma50 or snapshot.current_price
-    )
+    bullish_trend_score = _directional_trend_score(trend_info, FUTURES_LONG)
+    bearish_trend_score = _directional_trend_score(trend_info, FUTURES_SHORT)
+    ma20 = indicators.ma20 or snapshot.current_price
+    ma50 = indicators.ma50 or snapshot.current_price
+    rsi = indicators.rsi or 50.0
+    above_mas = snapshot.current_price >= ma20 and snapshot.current_price >= ma50
+    below_mas = snapshot.current_price <= ma20 and snapshot.current_price <= ma50
 
-    extension_penalty = 0.0
+    long_extension_penalty = 0.0
+    short_extension_penalty = 0.0
     risk_notes: List[str] = []
-    if distance_from_high <= 2.5 and (indicators.rsi or 50.0) > 72:
-        extension_penalty += 12
+    if distance_from_high <= 2.5 and rsi > 72:
+        long_extension_penalty += 12
         risk_notes.append("price is near recent highs with stretched RSI")
     if snapshot.price_change_24h >= 0.7 * max(weekly_change, 1.0) and snapshot.price_change_24h >= 10:
-        extension_penalty += 8
+        long_extension_penalty += 8
         risk_notes.append("24h move already accounts for most of the weekly run")
+    if rebound_from_low <= 2.5 and rsi < 30:
+        short_extension_penalty += 12
+        risk_notes.append("price is near recent lows with already-oversold RSI")
+    if (
+        snapshot.price_change_24h <= -10
+        and abs(snapshot.price_change_24h) >= 0.7 * max(abs(min(weekly_change, 0.0)), 1.0)
+    ):
+        short_extension_penalty += 8
+        risk_notes.append("24h drop already accounts for most of the weekly drawdown")
     if indicators.volatility >= 0.09:
-        extension_penalty += 6
+        long_extension_penalty += 6
+        short_extension_penalty += 6
         risk_notes.append("volatility is elevated")
 
-    continuation_score = 32.0
-    continuation_score += min(max(weekly_change, 0.0), 18.0) * 1.1
-    continuation_score += min(max(indicators.momentum, 0.0), 15.0) * 1.2
-    continuation_score += min(trend_score, 60.0) * 0.35
-    continuation_score += min(indicators.volume_ratio, 5.0) * 3.2
+    long_continuation = 32.0
+    long_continuation += min(max(weekly_change, 0.0), 18.0) * 1.1
+    long_continuation += min(max(indicators.momentum, 0.0), 15.0) * 1.2
+    long_continuation += min(bullish_trend_score, 60.0) * 0.35
+    long_continuation += min(indicators.volume_ratio, 5.0) * 3.2
     if above_mas:
-        continuation_score += 8
-    if 45 <= (indicators.rsi or 50.0) <= 68:
-        continuation_score += 5
-    elif (indicators.rsi or 50.0) > 78:
-        continuation_score -= 10
+        long_continuation += 8
+    if 45 <= rsi <= 68:
+        long_continuation += 5
+    elif rsi > 78:
+        long_continuation -= 10
+
+    short_continuation = 32.0
+    short_continuation += min(abs(min(weekly_change, 0.0)), 18.0) * 1.1
+    short_continuation += min(abs(min(indicators.momentum, 0.0)), 15.0) * 1.2
+    short_continuation += min(bearish_trend_score, 60.0) * 0.35
+    short_continuation += min(indicators.volume_ratio, 5.0) * 3.0
+    if below_mas:
+        short_continuation += 8
+    if 34 <= rsi <= 58:
+        short_continuation += 5
+    elif rsi < 22:
+        short_continuation -= 10
 
     market_regime = regime.get("label", "UNKNOWN")
     if market_regime in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
-        continuation_score -= 8
+        long_continuation -= 8
+        short_continuation += 4
         risk_notes.append("market regime is weak for alt continuation")
     elif market_regime == "RISK_ON":
-        continuation_score += 4
+        long_continuation += 4
+        short_continuation -= 5
 
-    deep_score = max(0.0, min(100.0, continuation_score - extension_penalty + liquidity_score * 0.12))
+    long_deep_score = max(
+        0.0,
+        min(100.0, long_continuation - long_extension_penalty + liquidity_score * 0.12),
+    )
+    short_deep_score = max(
+        0.0,
+        min(100.0, short_continuation - short_extension_penalty + liquidity_score * 0.12),
+    )
+    deep_score = max(long_deep_score, short_deep_score)
+    if long_deep_score >= short_deep_score + 5:
+        structure_bias = FUTURES_LONG
+    elif short_deep_score >= long_deep_score + 5:
+        structure_bias = FUTURES_SHORT
+    else:
+        structure_bias = "MIXED"
 
     holder_risk_proxy = 20.0
     if snapshot.market_cap and snapshot.market_cap <= 75_000_000 and liquidity_score < 35:
@@ -235,12 +313,17 @@ def analyse_deep_context(
 
     return {
         "deep_score": round(deep_score, 2),
+        "long_deep_score": round(long_deep_score, 2),
+        "short_deep_score": round(short_deep_score, 2),
+        "structure_bias": structure_bias,
         "liquidity_score": round(liquidity_score, 2),
-        "risk_score": round(max(holder_risk_proxy, extension_penalty * 5.0), 2),
+        "risk_score": round(max(holder_risk_proxy, max(long_extension_penalty, short_extension_penalty) * 5.0), 2),
         "distance_from_high_pct": round(distance_from_high, 3),
         "rebound_from_low_pct": round(rebound_from_low, 3),
         "weekly_change_pct": round(weekly_change, 3),
-        "extension_penalty": round(extension_penalty, 2),
+        "extension_penalty": round(max(long_extension_penalty, short_extension_penalty), 2),
+        "long_extension_penalty": round(long_extension_penalty, 2),
+        "short_extension_penalty": round(short_extension_penalty, 2),
         "liquidity_ratio": round(liquidity_ratio, 5),
         "market_regime": market_regime,
         "market_regime_score": round(regime.get("score", 50.0), 2),
@@ -256,17 +339,22 @@ def score_watchlist_candidate(
     regime: dict,
 ) -> float:
     """Internal shortlist score before the final publish decision."""
+    preferred_direction = FUTURES_SHORT if str(pump.direction).upper() == FUTURES_SHORT else FUTURES_LONG
     score = rough_score * 0.48
-    score += deep_context.get("deep_score", 0.0) * 0.32
+    score += _directional_deep_score(deep_context, preferred_direction) * 0.32
     score += deep_context.get("liquidity_score", 0.0) * 0.12
     score += regime.get("score", 50.0) * 0.08
 
-    if regime.get("label") in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
+    if preferred_direction == FUTURES_LONG and regime.get("label") in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
         score -= 8
+    elif preferred_direction == FUTURES_SHORT and regime.get("label") == "RISK_ON" and snapshot.symbol not in MAJOR_SYMBOLS:
+        score -= 6
     if deep_context.get("risk_score", 0.0) >= 72:
         score -= 10
     if pump.total_score >= 95:
         score += 3
+    if deep_context.get("structure_bias") == preferred_direction:
+        score += 4
 
     return round(max(0.0, min(100.0, score)), 2)
 
@@ -282,28 +370,33 @@ def calculate_final_publish_score(
     futures_context: Optional[dict] = None,
 ) -> float:
     """Final decision score used for the published signal only."""
+    preferred_direction = FUTURES_SHORT if str(ai_action).upper() == "SHORT" else FUTURES_LONG
     score = prior_final_score * 0.42
     score += quality_score * 0.18
     score += ai_confidence * 0.12
-    score += deep_context.get("deep_score", 0.0) * 0.18
+    score += _directional_deep_score(deep_context, preferred_direction) * 0.18
     score += deep_context.get("liquidity_score", 0.0) * 0.08
     score += regime.get("score", 50.0) * 0.05
 
     if futures_context and futures_context.get("has_data"):
         score += futures_context.get("futures_score", 0.0) * 0.09
-        if futures_context.get("trade_bias") == "LONG":
+        if _action_matches_bias(ai_action, futures_context.get("trade_bias", "")):
             score += 4
-        elif futures_context.get("trade_bias") == "SHORT":
-            score -= 12
+        elif futures_context.get("trade_bias") == FUTURES_WAIT:
+            score -= 8
         else:
-            score -= 4
+            score -= 12
 
-    if ai_action != "BUY":
+    if str(ai_action).upper() not in {"BUY", "SHORT"}:
         score -= 18
-    if regime.get("label") == "PANIC" and snapshot.symbol not in MAJOR_SYMBOLS:
+    if regime.get("label") == "PANIC" and str(ai_action).upper() == "BUY" and snapshot.symbol not in MAJOR_SYMBOLS:
         score -= 12
-    elif regime.get("label") == "RISK_OFF" and snapshot.symbol not in MAJOR_SYMBOLS:
+    elif regime.get("label") == "RISK_OFF" and str(ai_action).upper() == "BUY" and snapshot.symbol not in MAJOR_SYMBOLS:
         score -= 7
+    elif regime.get("label") == "RISK_ON" and str(ai_action).upper() == "SHORT" and snapshot.symbol not in MAJOR_SYMBOLS:
+        score -= 7
+    elif regime.get("label") in {"PANIC", "RISK_OFF"} and str(ai_action).upper() == "SHORT":
+        score += 3
 
     score -= min(deep_context.get("risk_score", 0.0), 100.0) * 0.08
     if futures_context and abs(futures_context.get("spread", 0.0)) >= 1.5:
@@ -313,6 +406,9 @@ def calculate_final_publish_score(
 
 def summarize_futures_context(
     snapshot: MarketSnapshot,
+    indicators: IndicatorSet,
+    trend_info: Optional[dict],
+    deep_context: dict,
     regime: dict,
     derivatives: Optional[List[dict]],
 ) -> dict:
@@ -327,8 +423,8 @@ def summarize_futures_context(
     if not rows or not snapshot.coindcx_has_futures:
         return {
             "has_data": False,
-            "trade_bias": "NO-DATA",
-            "leverage_hint": "1x",
+            "trade_bias": FUTURES_UNAVAILABLE,
+            "leverage_hint": "Unavailable",
             "futures_exchange": "CoinDCX",
             "futures_symbol": snapshot.coindcx_futures_instrument or "",
             "funding_rate": 0.0,
@@ -337,6 +433,9 @@ def summarize_futures_context(
             "spread": 0.0,
             "futures_volume_24h": 0.0,
             "futures_score": 0.0,
+            "matrix_score_long": 0.0,
+            "matrix_score_short": 0.0,
+            "confidence_label": "Unavailable",
             "notes": ["no active CoinDCX futures instrument found for this symbol"],
         }
 
@@ -352,8 +451,8 @@ def summarize_futures_context(
     if not matches:
         return {
             "has_data": False,
-            "trade_bias": "NO-DATA",
-            "leverage_hint": "1x",
+            "trade_bias": FUTURES_UNAVAILABLE,
+            "leverage_hint": "Unavailable",
             "futures_exchange": "CoinDCX",
             "futures_symbol": snapshot.coindcx_futures_instrument or "",
             "funding_rate": 0.0,
@@ -362,6 +461,9 @@ def summarize_futures_context(
             "spread": 0.0,
             "futures_volume_24h": 0.0,
             "futures_score": 0.0,
+            "matrix_score_long": 0.0,
+            "matrix_score_short": 0.0,
+            "confidence_label": "Unavailable",
             "notes": ["CoinDCX futures universe does not include this symbol"],
         }
 
@@ -397,8 +499,20 @@ def summarize_futures_context(
     max_long = _safe_float(details.get("max_leverage_long") or snapshot.coindcx_max_leverage_long or 1.0, 1.0)
     max_short = _safe_float(details.get("max_leverage_short") or snapshot.coindcx_max_leverage_short or max_long, max_long)
 
-    score = 48.0
+    score = 42.0
     notes: List[str] = []
+    bullish_trend_score = _directional_trend_score(trend_info, FUTURES_LONG)
+    bearish_trend_score = _directional_trend_score(trend_info, FUTURES_SHORT)
+    risk_score = _safe_float(deep_context.get("risk_score"), 50.0)
+    liquidity_score = _safe_float(deep_context.get("liquidity_score"), 0.0)
+    extension_penalty = _safe_float(deep_context.get("extension_penalty"), 0.0)
+    rsi = _safe_float(indicators.rsi, 50.0)
+    ma20 = _safe_float(indicators.ma20, snapshot.current_price)
+    ma50 = _safe_float(indicators.ma50, snapshot.current_price)
+    volume_ratio = _safe_float(indicators.volume_ratio, 1.0)
+    momentum = _safe_float(indicators.momentum, 0.0)
+    bullish_ma_stack = snapshot.current_price >= ma20 >= ma50 if ma20 and ma50 else False
+    bearish_ma_stack = snapshot.current_price <= ma20 <= ma50 if ma20 and ma50 else False
 
     if max_long >= 20:
         score += 8
@@ -450,22 +564,75 @@ def summarize_futures_context(
     elif regime_label in {"PANIC", "RISK_OFF"} and snapshot.symbol not in MAJOR_SYMBOLS:
         score -= 6
 
-    if snapshot.price_change_24h > 0 and basis >= -0.40 and regime_label not in {"PANIC", "RISK_OFF"}:
-        trade_bias = "LONG"
-    elif snapshot.price_change_24h < 0 and basis <= 0 and regime_label in {"PANIC", "RISK_OFF", "RANGE"}:
-        trade_bias = "SHORT"
-    else:
-        trade_bias = "NO-TRADE"
+    long_matrix = 0.0
+    long_matrix += _clamp((volume_ratio - 1.0) / 3.0, 0.0, 1.0) * 16.0
+    long_matrix += _clamp(momentum / 12.0, 0.0, 1.0) * 16.0
+    long_matrix += _clamp(bullish_trend_score / 55.0, 0.0, 1.0) * 16.0
+    long_matrix += _clamp(liquidity_score / 80.0, 0.0, 1.0) * 8.0
+    long_matrix += 10.0 if bullish_ma_stack else 0.0
+    long_matrix += 8.0 if 48.0 <= rsi <= 68.0 else 3.0 if 68.0 < rsi <= 74.0 else 0.0
+    long_matrix += 8.0 if basis >= -0.25 else 3.0 if basis >= -0.60 else 0.0
+    long_matrix += 8.0 if spread_abs <= 0.25 and spread_abs > 0 else 4.0 if spread_abs <= 0.70 else 0.0
+    long_matrix += 6.0 if open_interest >= 10_000_000 else 0.0
+    long_matrix += 4.0 if futures_volume_24h >= 20_000_000 else 0.0
+    long_matrix += 4.0 if regime_label in {"RISK_ON", "ROTATION"} else 0.0
+    long_matrix -= 10.0 if rsi > 78.0 else 4.0 if rsi > 72.0 else 0.0
+    long_matrix -= _clamp(extension_penalty, 0.0, 12.0) * 0.8
+    long_matrix -= _clamp((risk_score - 40.0) / 30.0, 0.0, 1.0) * 12.0
+    long_matrix -= 5.0 if funding_rate >= 0.05 else 0.0
 
-    recommended_cap = max(1.0, min(max_long, COINDCX_RECOMMENDED_LEVERAGE_CAP))
-    if trade_bias == "LONG" and score >= 82 and spread_abs <= 0.30 and basis_abs <= 0.35 and snapshot.market_cap >= 1_000_000_000:
-        leverage_hint = f"{int(min(3.0, recommended_cap))}x / max {int(max_long)}x"
-    elif trade_bias == "LONG" and score >= 68:
-        leverage_hint = f"{int(min(2.0, recommended_cap))}x / max {int(max_long)}x"
-    elif trade_bias == "SHORT" and score >= 72:
-        leverage_hint = f"1x / max {int(max_short)}x short"
+    short_matrix = 0.0
+    short_matrix += _clamp(abs(min(momentum, 0.0)) / 10.0, 0.0, 1.0) * 16.0
+    short_matrix += _clamp(bearish_trend_score / 55.0, 0.0, 1.0) * 16.0
+    short_matrix += 12.0 if bearish_ma_stack else 0.0
+    short_matrix += 10.0 if basis <= -0.25 else 4.0 if basis < 0 else 0.0
+    short_matrix += 8.0 if regime_label in {"PANIC", "RISK_OFF"} else 3.0 if regime_label == "RANGE" else 0.0
+    short_matrix += 6.0 if funding_rate >= 0.03 else 0.0
+    short_matrix += 6.0 if spread_abs <= 0.35 and spread_abs > 0 else 0.0
+    short_matrix += 6.0 if open_interest >= 10_000_000 else 0.0
+    short_matrix += 6.0 if snapshot.price_change_24h <= -4.0 else 0.0
+    short_matrix -= 8.0 if rsi < 32.0 else 0.0
+    short_matrix -= 5.0 if basis_abs > 1.2 else 0.0
+    short_matrix -= _clamp(_safe_float(deep_context.get("short_extension_penalty"), extension_penalty), 0.0, 12.0) * 0.7
+    short_matrix -= 5.0 if funding_rate <= -0.05 else 0.0
+
+    long_matrix = _clamp(long_matrix + score * 0.35, 0.0, 100.0)
+    short_matrix = _clamp(short_matrix + max(0.0, 55.0 - score) * 0.10 + score * 0.12, 0.0, 100.0)
+
+    if long_matrix >= 74.0 and long_matrix >= short_matrix + 8.0:
+        trade_bias = FUTURES_LONG
+    elif short_matrix >= 74.0 and short_matrix >= long_matrix + 8.0:
+        trade_bias = FUTURES_SHORT
     else:
-        leverage_hint = f"1x / max {int(max_long)}x"
+        trade_bias = FUTURES_WAIT
+
+    execution_score = max(long_matrix, short_matrix)
+
+    recommended_cap_long = max(1.0, min(max_long, COINDCX_RECOMMENDED_LEVERAGE_CAP))
+    recommended_cap_short = max(1.0, min(max_short, COINDCX_RECOMMENDED_LEVERAGE_CAP))
+    if trade_bias == FUTURES_LONG and execution_score >= 88 and risk_score <= 42 and spread_abs <= 0.30 and basis_abs <= 0.35:
+        leverage_hint = f"{int(min(3.0, recommended_cap_long))}x (max {int(max_long)}x)"
+    elif trade_bias == FUTURES_LONG and execution_score >= 78 and risk_score <= 58:
+        leverage_hint = f"{int(min(2.0, recommended_cap_long))}x (max {int(max_long)}x)"
+    elif trade_bias == FUTURES_LONG:
+        leverage_hint = f"1x (max {int(max_long)}x)"
+    elif trade_bias == FUTURES_SHORT and execution_score >= 88 and risk_score <= 42 and spread_abs <= 0.30 and basis_abs <= 0.45:
+        leverage_hint = f"{int(min(3.0, recommended_cap_short))}x short (max {int(max_short)}x)"
+    elif trade_bias == FUTURES_SHORT and execution_score >= 78 and risk_score <= 58:
+        leverage_hint = f"{int(min(2.0, recommended_cap_short))}x short (max {int(max_short)}x)"
+    elif trade_bias == FUTURES_SHORT:
+        leverage_hint = f"1x short (max {int(max_short)}x)"
+    else:
+        leverage_hint = "Wait"
+
+    if execution_score >= 88:
+        confidence_label = "High"
+    elif execution_score >= 78:
+        confidence_label = "Medium"
+    elif execution_score >= 68:
+        confidence_label = "Watch"
+    else:
+        confidence_label = "Weak"
 
     return {
         "has_data": True,
@@ -478,6 +645,9 @@ def summarize_futures_context(
         "basis": round(basis, 4),
         "spread": round(spread, 4),
         "futures_volume_24h": round(futures_volume_24h, 2),
-        "futures_score": round(max(0.0, min(100.0, score)), 2),
+        "futures_score": round(execution_score, 2),
+        "matrix_score_long": round(long_matrix, 2),
+        "matrix_score_short": round(short_matrix, 2),
+        "confidence_label": confidence_label,
         "notes": notes[:3],
     }

@@ -157,6 +157,7 @@ HTML = """
       font-weight: 600;
     }
     .badge-buy { background: #0d4429; color: #3fb950; }
+    .badge-short { background: #3d0b0b; color: #ff7b72; }
     .badge-avoid { background: #3d0b0b; color: #f85149; }
     .badge-hold { background: #2d2106; color: #d29922; }
     .badge-win { background: #0d4429; color: #3fb950; }
@@ -289,11 +290,12 @@ HTML = """
       <div class="hero-metrics">
         <span>Entry: {{ fmt_money(best_signal.entry_price) }}</span>
         <span>Target: {{ fmt_money(best_signal.target_price) }}</span>
+        <span>Stop: {{ fmt_money(best_signal.stop_loss) }}</span>
         <span>Confidence: {{ best_signal.confidence | int }}%</span>
         <span>Final: {{ (best_signal.aggregate_score or best_signal.quality_score or best_signal.pump_score) | int }}/100</span>
         <span>Regime: {{ best_signal.market_regime or "UNKNOWN" }}</span>
-        <span>Bias: {{ best_signal.futures_bias or "NO-DATA" }}</span>
-        <span>Lev: {{ best_signal.leverage_hint or "1x" }}</span>
+        <span>Setup: {{ best_signal.futures_bias or "UNAVAILABLE" }}</span>
+        <span>Suggested Lev: {{ best_signal.leverage_hint or "Unavailable" }}</span>
       </div>
       <p class="hero-reason">{{ best_signal.ai_reason }}</p>
     </div>
@@ -314,10 +316,11 @@ HTML = """
             <th>Action</th>
             <th>Entry</th>
             <th>Target</th>
+            <th>Stop</th>
             <th>Confidence</th>
             <th>Final</th>
-            <th>Bias</th>
-            <th>Lev</th>
+            <th>Setup</th>
+            <th>Suggested Lev</th>
             <th>Funding</th>
             <th>OI</th>
             <th>Outcome</th>
@@ -331,10 +334,11 @@ HTML = """
             <td><span class="badge badge-{{ s.ai_action | lower }}">{{ s.ai_action }}</span></td>
             <td>{{ fmt_money(s.entry_price) }}</td>
             <td>{{ fmt_money(s.target_price) }}</td>
+            <td>{{ fmt_money(s.stop_loss) }}</td>
             <td>{{ s.confidence | int }}%</td>
             <td>{{ (s.aggregate_score or s.quality_score or s.pump_score) | int }}/100</td>
-            <td>{{ s.futures_bias or "NO-DATA" }}</td>
-            <td>{{ s.leverage_hint or "1x" }}</td>
+            <td>{{ s.futures_bias or "UNAVAILABLE" }}</td>
+            <td>{{ s.leverage_hint or "Unavailable" }}</td>
             <td>{{ fmt_pct(s.funding_rate, 4) }}</td>
             <td>{{ fmt_compact(s.open_interest) }}</td>
             <td><span class="badge badge-{{ s.outcome | lower }}">{{ s.outcome }}</span></td>
@@ -362,8 +366,8 @@ HTML = """
             <th>Time (UTC)</th>
             <th>Coin</th>
             <th>Action</th>
-            <th>Bias</th>
-            <th>Lev</th>
+            <th>Setup</th>
+            <th>Suggested Lev</th>
             <th>Entry</th>
             <th>Target</th>
             <th>Stop</th>
@@ -382,8 +386,8 @@ HTML = """
             <td style="color:#8b949e">{{ fmt_timestamp(s.timestamp) }}</td>
             <td><strong>{{ s.symbol }}</strong><br><small style="color:#8b949e">{{ s.coin }}</small></td>
             <td><span class="badge badge-{{ s.ai_action | lower }}">{{ s.ai_action }}</span></td>
-            <td>{{ s.futures_bias or "NO-DATA" }}</td>
-            <td>{{ s.leverage_hint or "1x" }}</td>
+            <td>{{ s.futures_bias or "UNAVAILABLE" }}</td>
+            <td>{{ s.leverage_hint or "Unavailable" }}</td>
             <td>{{ fmt_money(s.entry_price) }}</td>
             <td>{{ fmt_money(s.target_price) }}</td>
             <td>{{ fmt_money(s.stop_loss) }}</td>
@@ -408,7 +412,9 @@ HTML = """
     <div class="section-title">Futures Layer</div>
     <p class="note">
       This section shows the derivatives confirmation being stored with current signals:
-      bias, conservative leverage hint, funding, open interest, basis, spread, and futures volume.
+      `LONG` means futures support a long setup, `SHORT` means futures support a short setup,
+      `WAIT` means stand aside for now, and `UNAVAILABLE` means live CoinDCX futures
+      confirmation is missing.
     </p>
     {% if latest_signals %}
     <div class="table-wrap">
@@ -416,7 +422,7 @@ HTML = """
         <thead>
           <tr>
             <th>Coin</th>
-            <th>Bias</th>
+            <th>Setup</th>
             <th>Leverage</th>
             <th>Futures Score</th>
             <th>Funding</th>
@@ -431,8 +437,8 @@ HTML = """
           {% for s in latest_signals %}
           <tr>
             <td><strong>{{ s.symbol }}</strong><br><small style="color:#8b949e">{{ s.coin }}</small></td>
-            <td>{{ s.futures_bias or "NO-DATA" }}</td>
-            <td>{{ s.leverage_hint or "1x" }}</td>
+            <td>{{ s.futures_bias or "UNAVAILABLE" }}</td>
+            <td>{{ s.leverage_hint or "Unavailable" }}</td>
             <td>{{ (s.futures_score or 0) | int }}/100</td>
             <td>{{ fmt_pct(s.funding_rate, 4) }}</td>
             <td>{{ fmt_compact(s.open_interest) }}</td>
@@ -532,8 +538,24 @@ def _format_timestamp(value):
 
 def _normalise_signal(signal: dict) -> dict:
     merged = dict(signal)
-    merged.setdefault("futures_bias", "NO-DATA")
-    merged.setdefault("leverage_hint", "1x")
+    bias = str(merged.get("futures_bias") or "").upper()
+    if bias == "NO-DATA":
+        merged["futures_bias"] = "UNAVAILABLE"
+    elif bias == "NO-TRADE":
+        merged["futures_bias"] = "WAIT"
+    else:
+        merged.setdefault("futures_bias", "UNAVAILABLE")
+
+    leverage_hint = str(merged.get("leverage_hint") or "").strip()
+    if merged.get("futures_bias") == "UNAVAILABLE" and (not leverage_hint or leverage_hint == "1x"):
+        merged["leverage_hint"] = "Unavailable"
+    elif merged.get("futures_bias") == "WAIT" and (not leverage_hint or leverage_hint == "1x"):
+        merged["leverage_hint"] = "Wait"
+    elif not leverage_hint:
+        merged["leverage_hint"] = "Unavailable"
+    else:
+        merged.setdefault("leverage_hint", leverage_hint)
+
     merged.setdefault("futures_exchange", "")
     merged.setdefault("futures_symbol", "")
     merged.setdefault("funding_rate", 0.0)
@@ -548,9 +570,16 @@ def _normalise_signal(signal: dict) -> dict:
     return merged
 
 
+def _is_live_trade_signal(signal: dict) -> bool:
+    action = str(signal.get("ai_action") or "").upper()
+    bias = str(signal.get("futures_bias") or "").upper()
+    return (action == "BUY" and bias == "LONG") or (action == "SHORT" and bias == "SHORT")
+
+
 @app.route("/")
 def index():
-    latest_signals = [_normalise_signal(row) for row in get_recent_signals(LATEST_SIGNALS_LIMIT)]
+    recent_pool = [_normalise_signal(row) for row in get_recent_signals(max(LATEST_SIGNALS_LIMIT * 5, 40))]
+    latest_signals = [row for row in recent_pool if _is_live_trade_signal(row)][:LATEST_SIGNALS_LIMIT]
     history_signals = [_normalise_signal(row) for row in get_recent_signals(HISTORY_SIGNALS_LIMIT)]
     stats = get_stats()
     weights = load_weights()
@@ -576,7 +605,8 @@ def index():
 @app.route("/api/signals")
 def api_signals():
     limit = request.args.get("limit", default=LATEST_SIGNALS_LIMIT, type=int)
-    return jsonify([_normalise_signal(row) for row in get_recent_signals(limit)])
+    pool = [_normalise_signal(row) for row in get_recent_signals(max(limit * 5, 40))]
+    return jsonify([row for row in pool if _is_live_trade_signal(row)][:limit])
 
 
 @app.route("/api/history")
@@ -609,12 +639,12 @@ def _pick_best_signal(signals):
         return None
 
     def rank(signal):
-        action_priority = {"BUY": 2, "HOLD": 1, "AVOID": 0}.get(signal.get("ai_action"), 0)
+        action_priority = {"BUY": 2, "SHORT": 2, "HOLD": 1, "AVOID": 0}.get(signal.get("ai_action"), 0)
         bias_priority = {
             "LONG": 2,
-            "NO-TRADE": 1,
-            "NO-DATA": 0,
-            "SHORT": -1,
+            "SHORT": 2,
+            "WAIT": 1,
+            "UNAVAILABLE": 0,
         }.get(signal.get("futures_bias"), 0)
         return (
             action_priority,
