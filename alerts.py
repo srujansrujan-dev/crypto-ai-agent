@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 
 from config import DEFAULT_STOP_LOSS_PCT, DEFAULT_TARGET_PCT
+from config import get_dashboard_display_url
 from signals import TradingSignal
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ def send_cycle_summary(cycle: int, scanned: int, opportunities: int, signals: in
 
 
 def send_startup_banner() -> None:
+    dashboard_url = get_dashboard_display_url()
     banner = f"""
 {CYAN}{'=' * 60}{RESET}
 {BOLD}   CRYPTO AI AGENT  -  Market Analysis System{RESET}
@@ -97,7 +99,7 @@ def send_startup_banner() -> None:
   Signal mode : Directional analysis only (LONG and SHORT suggestions)
   AI engine   : Gemini
   Scan every  : 5 minutes
-  Dashboard   : http://localhost:8080
+  Dashboard   : {dashboard_url}
 {'-' * 60}
 """
     print(banner)

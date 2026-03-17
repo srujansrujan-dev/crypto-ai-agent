@@ -80,3 +80,20 @@ DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = int(os.getenv("PORT", 8080))
 LATEST_SIGNALS_LIMIT = 10
 HISTORY_SIGNALS_LIMIT = 250
+
+
+def get_dashboard_display_url() -> str:
+    explicit = os.getenv("DASHBOARD_PUBLIC_URL", "").strip()
+    if explicit:
+        return explicit
+
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if render_url:
+        return render_url
+
+    render_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    if render_hostname:
+        return f"https://{render_hostname}"
+
+    host = "localhost" if DASHBOARD_HOST in {"0.0.0.0", "::"} else DASHBOARD_HOST
+    return f"http://{host}:{DASHBOARD_PORT}"

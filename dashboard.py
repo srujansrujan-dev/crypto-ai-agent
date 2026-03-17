@@ -20,6 +20,7 @@ from config import (
     DASHBOARD_PORT,
     HISTORY_SIGNALS_LIMIT,
     LATEST_SIGNALS_LIMIT,
+    get_dashboard_display_url,
 )
 from learning_engine import (
     enrich_signal_simulation,
@@ -920,4 +921,4 @@ def start_dashboard() -> None:
 
     thread = threading.Thread(target=_run, daemon=True, name="dashboard")
     thread.start()
-    logger.info("Dashboard started at http://%s:%d", DASHBOARD_HOST, DASHBOARD_PORT)
+    logger.info("Dashboard started at %s", get_dashboard_display_url())
